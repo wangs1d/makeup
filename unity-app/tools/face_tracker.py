@@ -158,7 +158,7 @@ def main() -> None:
             sys.exit(2)
         print(f"输入源：camera {args.camera}")
 
-    filt = OneEuroFilter(min_cutoff=1.4, beta=0.05) if args.smooth else None
+    filt = OneEuroFilter(min_cutoff=1.4, beta=0.5) if args.smooth else None  # local 为厘米
     print(f"face_tracker → udp://{args.host}:{args.port}"
           f"（{'binary v2' if not args.legacy_json else 'legacy json'}，focal≈{focal_px:.0f}px，Ctrl+C 退出）")
 

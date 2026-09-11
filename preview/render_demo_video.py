@@ -148,6 +148,11 @@ def rounded(d: ImageDraw.ImageDraw, box, r, fill=None, outline=None, width=1):
     d.rounded_rectangle(box, radius=r, fill=fill, outline=outline, width=width)
 
 
+def glyph_safe(text: str) -> str:
+    """msyh 缺 U+2713（✓）等字形，替换为可渲染的近似符号。"""
+    return str(text).replace("✓", "√")
+
+
 def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
             spec_name: str | None, env: str) -> np.ndarray:
     img = Image.fromarray(frame_bgr[..., ::-1]).convert("RGBA")
@@ -168,6 +173,7 @@ def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
         bubbles = bubbles[-4:]  # 指导章节给底部步骤条留空间
     for bt, text, prio, is_note in bubbles:
         who = "agent" if is_note else "coach"
+        text = glyph_safe(text)
         col = ACCENT if is_note else (WARN if prio == "warn" else (120, 200, 255, 255))
         d.text((PX + 24, y), f"{who} · {bt:5.1f}s", font=f_s, fill=col)
         y += 28
@@ -193,7 +199,7 @@ def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
             outline=(70, 74, 86, 255), width=3)
     d.rectangle([VX + 14, VY + 12, VX + 14 + 12, VY + 24], fill=GREEN)
     d.text((VX + 38, VY + 10), "bridge: connected", font=f_s, fill=FG)
-    d.text((VX + 220, VY + 10), f"tracking: ok · 30 fps · 468 pts · pose ✓ · env {env}", font=f_s, fill=FG)
+    d.text((VX + 220, VY + 10), f"tracking: ok · 30 fps · 468 pts · pose √ · env {env}", font=f_s, fill=FG)
     d.text((VX + VW - 16, VY + VH - 34), "Python 预览渲染（Unity App 同管线：蒙版/溅射/光照）",
            font=font(18), fill=(200, 202, 210, 200), anchor="ra")
 
@@ -213,13 +219,13 @@ def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
         text, prio, prog = coach
         alpha = int(255 * min(1.0, (1 - prog) * 3) if prog > 0.8 else 255)
         col = WARN if prio == "warn" else (255, 255, 255, alpha)
-        d.text((VX + VW // 2, VY + VH - 118), text, font=font(28), fill=col, anchor="mm")
+        d.text((VX + VW // 2, VY + VH - 118), glyph_safe(text), font=font(28), fill=col, anchor="mm")
 
     # 步骤进度条（指导章节期间，由 coaching 消息的 step/steps/progress 驱动）
     if in_coach:
         pr = tl.progress_at(t)
         x0, y0 = PX + 24, H - 58
-        rounded(d, [PX + 12, y0 - 44, W - 12, y0 + 30], 10, fill=(16, 17, 22, 220))
+        rounded(d, [PX + 12, y0 - 48, W - 12, y0 + 30], 10, fill=(16, 17, 22, 220))
         d.text((x0, y0 - 36), "化妆步骤（live_coach 推送）", font=font(18), fill=FG_DIM)
         if pr:
             step, steps, name, progress = pr

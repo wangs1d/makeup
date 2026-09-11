@@ -330,8 +330,10 @@ class FrameAssembler:
         if len(slot["parts"]) < slot["count"]:
             return None
         jpeg = b"".join(slot["parts"][i] for i in range(slot["count"]))
-        # 完成：丢弃所有更旧的帧
+        # 完成：丢弃所有更旧的（未完成）帧
         for k in [k for k in self._pending if k <= fid]:
+            if k != fid:
+                self.dropped += 1
             self._pending.pop(k, None)
         if len(jpeg) != slot["total"]:
             self.dropped += 1

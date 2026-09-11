@@ -68,13 +68,14 @@ namespace MakeupMirror
         public void Reset() { _x.Reset(); _y.Reset(); _z.Reset(); }
     }
 
-    /// 关键点阵 1€ 滤波（468×3），共享同一套参数
+    /// 关键点阵 1€ 滤波（468×3），共享同一套参数。
+    /// 注意尺度：点数据是米——beta 的单位是 Hz/(m/s)，典型头部运动 0.02m/s 需要几十才有效
     public class OneEuroCloud
     {
         private OneEuroScalar[] _f;
         private readonly float _minCutoff, _beta, _dCutoff;
 
-        public OneEuroCloud(float minCutoff = 1.4f, float beta = 0.06f, float dCutoff = 1f)
+        public OneEuroCloud(float minCutoff = 0.8f, float beta = 75f, float dCutoff = 1f)
         {
             _minCutoff = minCutoff; _beta = beta; _dCutoff = dCutoff;
         }
@@ -120,9 +121,9 @@ namespace MakeupMirror
             if (!_init)
             {
                 _init = true;
-                _tx = new OneEuroScalar(1.4f, 0.06f);
-                _ty = new OneEuroScalar(1.4f, 0.06f);
-                _tz = new OneEuroScalar(1.4f, 0.06f);
+                _tx = new OneEuroScalar(1.0f, 75f);
+                _ty = new OneEuroScalar(1.0f, 75f);
+                _tz = new OneEuroScalar(1.0f, 75f);
                 _q = rot;
                 return (pos, rot);
             }

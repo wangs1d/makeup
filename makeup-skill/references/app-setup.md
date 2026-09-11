@@ -26,14 +26,17 @@ App 端口等参数可在其旁边的 `appsettings.json` 修改（`bridge_url`�
 
 ## 人脸追踪 sidecar
 
-App 本身不做人脸关键点检测；由 Python sidecar 提供 landmarks（468 点）：
+App 本身不做人脸关键点检测；由 Python sidecar 提供关键点（468 点）+ 6DoF 头部姿态：
 
 ```bash
 pip install mediapipe opencv-python numpy
-python unity-app/tools/face_tracker.py          # 默认摄像头 0，UDP 127.0.0.1:8766
+python unity-app/tools/face_tracker.py --relay    # 推荐：接收 App 中继帧（单摄像头闭环）
+python unity-app/tools/face_tracker.py            # 旧模式：sidecar 自开摄像头
+python unity-app/tools/face_tracker.py --synthetic # 无摄像头/无 mediapipe 的联调模拟
 ```
 
-先启动 sidecar 再启动 App；App 标题栏显示 `tracking: ok` 即正常。
+先启动 sidecar 再启动 App；App 状态栏显示 `tracking: ok · N fps · pose ✓` 即正常
+（无 `pose ✓` 说明还在走旧版 v1 JSON 兼容路径，妆容退回固定平面映射）。
 sidecar 完全本地运行，不上传任何画面。
 
 ## 无 App 时的降级

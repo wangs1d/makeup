@@ -27,7 +27,8 @@ python <skill_dir>/scripts/setup_check.py
 
 - 依赖未装 → `pip install -r <skill_dir>/requirements.txt`
 - VLM 未配置 → 需要设置环境变量（见下文「VLM 配置」），能力二/三必须，能力一不需要
-- Bridge 未运行 → `python <skill_dir>/scripts/bridge_server.py &`（后台启动，默认端口 8765）
+- Bridge 未运行 → `python <skill_dir>/scripts/bridge_server.py &`（后台启动，默认端口 8765；
+  若提示"端口被其他服务占用"，换 `--port 8865` 并 `set MAKEUP_BRIDGE_URL=ws://127.0.0.1:8865`）
 - App 未连接 → 按 `references/app-setup.md` 引导用户启动试妆 App（能力一/三必须）
 
 ## VLM 配置
@@ -56,6 +57,8 @@ python <skill_dir>/scripts/apply_spec.py --spec <skill_dir>/presets/daily-natura
 3. 可调参数（用户口头提出时）：
    - 整体妆感浓淡：`python <skill_dir>/scripts/apply_spec.py --spec <...> --intensity 0.6`（0~1，覆盖 spec 里的 intensity）
    - 只试单件（如只换口红不卸其他）：`--only lipstick`（region 名，多个逗号分隔）
+   - 解析出的新妆容免手动烘焙：加 `--bake`（自动烘资产再下发，大资产自动走 HTTP 侧车）
+   - 多个试妆 App 在线时定向下发：`--to <client_id>`（client_id 见 status）
    - 卸妆还原：`python <skill_dir>/scripts/apply_spec.py --clear`
 4. 完成后告知用户 App 里可拖动强度滑杆微调；确认用户满意即结束。
 
@@ -70,8 +73,10 @@ python <skill_dir>/scripts/apply_spec.py --spec <skill_dir>/presets/daily-natura
 python <skill_dir>/scripts/parse_look.py --input <素材路径> --out <工作目录>/parsed
 ```
 
-   产出：`makeup_spec.json`（可直接试妆）+ `analysis.md`（人话版妆面报告）。
-3. 用 `analysis.md` 向用户复述解析结果（妆面风格、各部位色号与画法），确认符合预期。
+   产出：`makeup_spec.json`（可直接试妆）+ `analysis.md`（人话版妆面报告）
+   + `preview.jpg`（无妆 | 同款妆 并排效果图，与 App 同一套渲染规则）。
+3. 把 `preview.jpg` 给用户看，并用 `analysis.md` 复述解析结果（妆面风格、各部位色号与画法），
+   确认符合预期（也可以随时用 `render_look.py --spec <...> --out <...> --env warm` 重出效果图）。
 4. 用户认可后按工作流一试妆：`apply_spec.py --spec <工作目录>/parsed/makeup_spec.json`。
 
 注意事项：
@@ -87,9 +92,14 @@ python <skill_dir>/scripts/live_coach.py --spec <目标妆容spec> --interval 5
 ```
 
 - `--interval`：采样间隔秒数，默认 5。
-- 它会持续运行（Ctrl+C 或 `--duration 600` 限时结束）：每轮取帧 → VLM 对比 → 生成下一步指导 → 推送到 App 显示（文字+语音提示），同时在控制台输出。
-- 指导按 spec 的 `steps` 顺序推进（先底妆→眉→眼→腮红→唇），同一提醒不会重复轰炸；环境光过暗会顺带提醒。
-- 结束时向用户做一次口头总结（完成了哪些步骤、哪些部位建议再补）。
+- 启动时自动把目标妆容渲染成**参考图**（`preview_render`，与 App 同管线），随每轮与摄像头帧
+  一起发给 VLM 做视觉对比（`--no-reference` 关闭）。
+- 它会持续运行（Ctrl+C 或 `--duration 600` 限时结束）：每轮取帧 → VLM 对比 → 生成下一步指导 →
+  推送到 App（文字+步骤进度条+语音提示），同时在控制台输出。
+- 指导按 spec 的 `steps` 顺序推进；步骤判定用最近 3 轮滑动窗投票（≥2 个 done 才推进，单帧误判
+  不跳步）；环境光过暗/过曝会顺带提醒。
+- 结束时输出 `session_report.md`（各步骤完成情况 + VLM 按部位评分与建议），并向用户口头总结。
+- 无 VLM key 的联调/演示：加 `--test`（离线剧本，走真实 Bridge 取帧与推送，不调模型）。
 
 隐私：只有开启实时指导时才会把采样帧发给 VLM 服务商；试妆渲染全程本地。主动告知用户这一点。
 
@@ -116,7 +126,8 @@ mesh 蒙版渲染还是 3DGS 溅射渲染（唇部体积感、高光用 splat）
 
 ## 文件索引
 
-- `scripts/` 可执行工具（apply_spec.py 封装 bridge 下发；其余见上文）
+- `scripts/` 可执行工具（apply_spec.py 封装 bridge 下发；preview_render.py 为渲染内核、
+  render_look.py 为效果图 CLI；其余见上文）
 - `presets/` 内置妆容
 - `references/schema.md` 妆容规格格式
 - `references/bridge-protocol.md` WebSocket 协议

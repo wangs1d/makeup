@@ -112,8 +112,9 @@ namespace MakeupMirror
             {
                 _smoothMin = responsiveness;
                 // responsiveness 0→稳（min_cutoff 低），1→跟手（min_cutoff 高）
+                // 点数据是米：beta 单位 Hz/(m/s)，30~120 覆盖 1~4cm/s 的头部运动
                 float minCutoff = Mathf.Lerp(0.6f, 2.2f, responsiveness);
-                float beta = Mathf.Lerp(0.02f, 0.1f, responsiveness);
+                float beta = Mathf.Lerp(30f, 120f, responsiveness);
                 _cloud = new OneEuroCloud(minCutoff, beta);
                 _poseSm = new PoseSmoother();
             }

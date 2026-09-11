@@ -56,9 +56,9 @@
 | `opacity` | 该层基础不透明度 0~1，实际 = opacity × intensity |
 | `finish` | `matte`（哑光）\| `satin`（缎光）\| `dewy`（水光）\| `gloss`（镜面唇釉） |
 | `color_stops` | 渐变色标。`at`=0 是靠近边缘/起始色，`at`=1 是中心/加深色；单色也写成一段（at 0 与 1 同色） |
-| `shape` | 区域形态参数（含义随 region 不同，见下表），可缺省用默认 |
+| `shape` | 区域形态参数（含义随 region 不同，见下表），可缺省用默认。`falloff`（0~1，默认 0.65）控制按区域边缘距离的羽化宽度；`lipstick.blur` 额外放大唇缘羽化（咬唇妆调大） |
 | `texture_strength` | 粉感/肌理强度：0 纯色平滑，1 强颗粒肌理（哑光粉质建议 0.3~0.6，唇釉 0~0.1） |
-| `render.type` | `mesh`：FLAME/MediaPipe 网格上的蒙版材质层；`splat`：高斯溅射体积层（唇釉、高光、卧蚕等需要"凸起来"的效果） |
+| `render.type` | `mesh`：FLAME/MediaPipe 网格上的蒙版材质层；`splat`：高斯溅射体积层（唇釉、高光、腮红、眼影、眉、睫毛均支持；foundation 等大面积层不支持，会退回 mesh） |
 | `render.splat` | splat 层参数：`thickness`（凸起厚度，米，典型 0.001~0.002）、`density`（0~1 高斯密度） |
 
 ## region 一览与 shape 语义
