@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Render / test outputs
+out/
+
+# Local tool config
+.zcode/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Unity generated
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+*.csproj
+*.sln

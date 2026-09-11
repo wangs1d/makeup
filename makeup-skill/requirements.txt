@@ -1,0 +1,8 @@
+# Makeup Assistant skill 依赖（Python 3.10+）
+websockets>=12.0        # bridge server 与各客户端脚本
+opencv-python>=4.8      # 视频抽帧、图像质量评估、摄像头自检
+numpy>=1.24
+pillow>=10.0            # 妆容资产纹理生成
+openai>=1.30            # VLM 访问（OpenAI 兼容接口，适配 GLM/GPT 等）
+# 可选：实时指导时本地人脸检测辅助（缺失时脚本自动降级为纯 VLM 判断）
+# mediapipe>=0.10

@@ -1,0 +1,124 @@
+{
+  "spec_version": "1.0",
+  "name": "office-polish",
+  "description": "干练职场妆：雾面底妆+大地色眼影+利落眉+枫叶色缎光唇，会议室也提气色",
+  "intensity": 0.7,
+  "layers": [
+    {
+      "id": "foundation-both",
+      "region": "foundation",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.65,
+      "finish": "matte",
+      "color_stops": [{ "at": 0.0, "hex": "#F2D3C0" }, { "at": 1.0, "hex": "#EECEBA" }],
+      "shape": { "coverage": "medium" },
+      "texture_strength": 0.35,
+      "render": { "type": "mesh" }
+    },
+    {
+      "id": "concealer-both",
+      "region": "concealer",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.6,
+      "finish": "satin",
+      "color_stops": [{ "at": 0.0, "hex": "#F5DECB" }, { "at": 1.0, "hex": "#F5DECB" }],
+      "shape": { "under_eye": true },
+      "texture_strength": 0.2,
+      "render": { "type": "mesh" }
+    },
+    {
+      "id": "contour-both",
+      "region": "contour",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.4,
+      "finish": "matte",
+      "color_stops": [{ "at": 0.0, "hex": "#B98B6E" }, { "at": 1.0, "hex": "#A87A5E" }],
+      "shape": { "strength": 0.5, "jaw": true, "nose": true },
+      "texture_strength": 0.45,
+      "render": { "type": "mesh" }
+    },
+    {
+      "id": "eyebrow-both",
+      "region": "eyebrow",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.7,
+      "finish": "matte",
+      "color_stops": [{ "at": 0.0, "hex": "#5E4433" }, { "at": 1.0, "hex": "#4C3626" }],
+      "shape": { "thickness": 0.5, "arch": 0.6, "tint": 0.9 },
+      "texture_strength": 0.4,
+      "render": { "type": "mesh" }
+    },
+    {
+      "id": "eyeshadow-left",
+      "region": "eyeshadow",
+      "side": "left",
+      "enabled": true,
+      "opacity": 0.6,
+      "finish": "matte",
+      "color_stops": [{ "at": 0.0, "hex": "#D9B493" }, { "at": 1.0, "hex": "#A57452" }],
+      "shape": { "spread": 0.45, "height": 0.3, "angle_deg": 8, "lower_lid": 0.1 },
+      "texture_strength": 0.5,
+      "render": { "type": "mesh" }
+    },
+    {
+      "id": "eyeshadow-right",
+      "region": "eyeshadow",
+      "side": "right",
+      "enabled": true,
+      "opacity": 0.6,
+      "finish": "matte",
+      "color_stops": [{ "at": 0.0, "hex": "#D9B493" }, { "at": 1.0, "hex": "#A57452" }],
+      "shape": { "spread": 0.45, "height": 0.3, "angle_deg": 8, "lower_lid": 0.1 },
+      "texture_strength": 0.5,
+      "render": { "type": "mesh" }
+    },
+    {
+      "id": "eyeliner-both",
+      "region": "eyeliner",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.7,
+      "finish": "matte",
+      "color_stops": [{ "at": 0.0, "hex": "#33241C" }, { "at": 1.0, "hex": "#33241C" }],
+      "shape": { "thickness": 0.25, "wing": 0.2, "lower": 0.0 },
+      "texture_strength": 0.0,
+      "render": { "type": "mesh" }
+    },
+    {
+      "id": "blush-both",
+      "region": "blush",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.4,
+      "finish": "matte",
+      "color_stops": [{ "at": 0.0, "hex": "#E4A08C" }, { "at": 1.0, "hex": "#D68C7C" }],
+      "shape": { "radius": 0.12, "angle_deg": 0, "falloff": 0.7 },
+      "texture_strength": 0.4,
+      "render": { "type": "mesh" }
+    },
+    {
+      "id": "lipstick-both",
+      "region": "lipstick",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.85,
+      "finish": "satin",
+      "color_stops": [{ "at": 0.0, "hex": "#C25B4E" }, { "at": 1.0, "hex": "#A8453C" }],
+      "shape": { "overline": 0.0, "blur": 0.05, "gradation": 0.0 },
+      "texture_strength": 0.15,
+      "render": { "type": "splat", "splat": { "thickness": 0.001, "density": 0.6 } }
+    }
+  ],
+  "steps": [
+    { "order": 1, "area": "base", "regions": ["foundation", "concealer", "contour"], "instruction": "雾面粉底均匀铺开，遮瑕点涂，鼻侧和下颌缘轻扫修容" },
+    { "order": 2, "area": "eyebrow", "regions": ["eyebrow"], "instruction": "画利落直眉或微挑眉，边缘收干净" },
+    { "order": 3, "area": "eye", "regions": ["eyeshadow", "eyeliner"], "instruction": "大地色从睫毛根向上晕染，眼线沿睫毛根填满，眼尾平拉少许" },
+    { "order": 4, "area": "blush", "regions": ["blush"], "instruction": "腮红打在颧骨下方偏中性位置，显气色但不抢眼" },
+    { "order": 5, "area": "lip", "regions": ["lipstick"], "instruction": "枫叶色唇膏涂满全唇，边缘用唇刷收利落" }
+  ],
+  "source": { "type": "preset", "origin": "built-in", "created_at": "2026-09-06" }
+}
