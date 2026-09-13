@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>3DGS 妆容效果预览</title>
+<style>
+  html,body{margin:0;height:100%;background:#141210;overflow:hidden;font-family:"Microsoft YaHei",system-ui,sans-serif}
+  #gl{width:100%;height:100%;display:block;cursor:grab}
+  #gl.drag{cursor:grabbing}
+  #bar{position:fixed;top:10px;left:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;z-index:5}
+  button{background:#2a2622;color:#e8dfd6;border:1px solid #4a423a;border-radius:6px;padding:5px 12px;font-size:13px;cursor:pointer}
+  button:hover{background:#3a342d}
+  button.on{background:#8a4a3a;border-color:#b06a52;color:#fff}
+  #divider{position:fixed;top:0;bottom:0;width:2px;background:rgba(255,255,255,.85);z-index:4;display:none;pointer-events:none}
+  #hint{position:fixed;bottom:10px;left:12px;color:#8d8378;font-size:12px;z-index:5;text-shadow:0 1px 2px #000}
+  #splitlbl{position:fixed;top:46px;left:50%;transform:translateX(-50%);color:#fff;font-size:12px;z-index:5;display:none;background:rgba(0,0,0,.4);padding:2px 10px;border-radius:8px}
+  #status{position:fixed;bottom:10px;right:12px;color:#8d8378;font-size:12px;z-index:5}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="bar">
+  <button id="b-front" class="on">正面</button>
+  <button id="b-three">3/4 侧</button>
+  <button id="b-side">侧面</button>
+  <button id="b-spin">自动旋转</button>
+  <button id="b-split">素颜对比</button>
+  <button id="b-snap">快照导出</button>
+  <button id="b-user" style="display:none">我的3D脸</button>
+</div>
+<div id="divider"></div>
+<div id="splitlbl">左：素颜 ｜ 右：妆容（拖动分割线）</div>
+<div id="hint">拖动旋转 · 滚轮缩放 · 双击复位</div>
+<div id="status">加载中…</div>
+<script>
+"use strict";
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl2", { antialias: false });
+if (!gl) { document.getElementById("status").textContent = "需要 WebGL2"; throw new Error("no webgl2"); }
+
+const VS = `#version 300 es
+precision highp float;
+in vec3 a_center; in vec3 a_scale; in vec4 a_rgba; in vec4 a_rot; in vec2 a_corner;
+uniform mat4 u_view, u_proj;
+uniform vec2 u_viewport;
+uniform float u_split;           // 像素 x 分割线
+uniform int u_keep;              // 0=全部 1=只画左 2=只画右
+out vec4 v_rgba; out vec3 v_conic; out vec2 v_pos;
+mat3 quatMat(vec4 q){
+  float x=q.x,y=q.y,z=q.z,w=q.w;
+  return mat3(1.-2.*(y*y+z*z), 2.*(x*y+w*z), 2.*(x*z-w*y),
+              2.*(x*y-w*z), 1.-2.*(x*x+z*z), 2.*(y*z+w*x),
+              2.*(x*z+w*y), 2.*(y*z-w*x), 1.-2.*(x*x+y*y));
+}
+void main(){
+  vec4 cam = u_view * vec4(a_center, 1.0);
+  vec4 clip = u_proj * cam;
+  if (clip.w < 0.05) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  vec2 ndc = clip.xy / clip.w;
+  float sx = (ndc.x*0.5+0.5)*u_viewport.x;
+  if (u_keep==1 && sx > u_split) { gl_Position=vec4(2.0,2.0,2.0,1.0); return; }
+  if (u_keep==2 && sx < u_split) { gl_Position=vec4(2.0,2.0,2.0,1.0); return; }
+  mat3 R = quatMat(a_rot);
+  mat3 S = mat3(a_scale.x,0.,0., 0.,a_scale.y,0., 0.,0.,a_scale.z);
+  mat3 Vrk = R * S * transpose(S) * transpose(R);
+  float focal_x = 0.5*u_viewport.x*u_proj[0][0];
+  float focal_y = 0.5*u_viewport.y*u_proj[1][1];
+  mat3 J = mat3(
+    focal_x/cam.z, 0., -(focal_x*cam.x)/(cam.z*cam.z),
+    0., -focal_y/cam.z, (focal_y*cam.y)/(cam.z*cam.z),
+    0., 0., 0.);
+  mat3 T = transpose(mat3(u_view)) * J;
+  mat3 cov2d = transpose(T) * Vrk * T;
+  cov2d[0][0] += 0.3; cov2d[1][1] += 0.3;
+  float mid = (cov2d[0][0]+cov2d[1][1])/2.0;
+  float radius = length(vec2((cov2d[0][0]-cov2d[1][1])/2.0, cov2d[0][1]));
+  float l1 = mid+radius, l2 = mid-radius;
+  if (l2 < 0.0) { gl_Position=vec4(2.0,2.0,2.0,1.0); return; }
+  vec2 dv0 = vec2(cov2d[0][1], l1-cov2d[0][0]);
+  vec2 dv = (dot(dv0, dv0) < 1e-12) ? vec2(1.0, 0.0) : normalize(dv0);
+  vec2 major = min(sqrt(2.0*l1), 1024.0)*dv;
+  vec2 minor = min(sqrt(2.0*l2), 1024.0)*vec2(dv.y, -dv.x);
+  float det = cov2d[0][0]*cov2d[1][1] - cov2d[0][1]*cov2d[0][1];
+  v_conic = vec3(cov2d[1][1], -cov2d[0][1], cov2d[0][0])/det;
+  v_rgba = a_rgba;
+  v_pos = a_corner;
+  vec2 center2 = clip.xy/clip.w;
+  gl_Position = vec4(center2 + a_corner.x*major/u_viewport*2.0 + a_corner.y*minor/u_viewport*2.0, 0.0, 1.0);
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec4 v_rgba; in vec3 v_conic; in vec2 v_pos;
+out vec4 outColor;
+void main(){
+  float power = -0.5*(v_conic.x*v_pos.x*v_pos.x + v_conic.z*v_pos.y*v_pos.y) - v_conic.y*v_pos.x*v_pos.y;
+  if (power > 0.0) discard;
+  float alpha = min(0.99, v_rgba.a * exp(power));
+  if (alpha < 1.0/255.0) discard;
+  outColor = vec4(v_rgba.rgb*alpha, alpha);
+}`;
+
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const U = {};
+for (const n of ["u_view","u_proj","u_viewport","u_split","u_keep"]) U[n] = gl.getUniformLocation(prog, n);
+
+// ---- 几何：每实例 13 floats = center(3) scale(3) rgba(4) quat(4) ----
+const STRIDE = 14 * 4;
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, STRIDE, gl.DYNAMIC_DRAW);
+const corner = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, corner);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-2,-2, 2,-2, 2,2, -2,-2, 2,2, -2,2]), gl.STATIC_DRAW);
+const aCorner = gl.getAttribLocation(prog, "a_corner");
+gl.enableVertexAttribArray(aCorner);
+gl.vertexAttribPointer(aCorner, 2, gl.FLOAT, false, 0, 0);
+// 注意：实例属性必须指向 vbo —— 重新绑定
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+function bindInst(name, size, off){
+  const loc = gl.getAttribLocation(prog, name);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, size, gl.FLOAT, false, STRIDE, off);
+  gl.vertexAttribDivisor(loc, 1);
+}
+bindInst("a_center", 3, 0);
+bindInst("a_scale", 3, 12);
+bindInst("a_rgba", 4, 24);
+bindInst("a_rot", 4, 40);
+
+// ---- 点云数据（妆容 / 素颜两份）----
+function decodeSplat(bytes){
+  const n = Math.floor(bytes.byteLength / 32);
+  const f32 = new Float32Array(bytes);
+  const u8 = new Uint8Array(bytes);
+  const arr = new Float32Array(n * 14);       // 每实例 14 floats：xyz3+scale3+rgba4+rot4
+  for (let i = 0; i < n; i++){
+    const o32 = i * 8, o8 = i * 32, o = i * 14;
+    arr[o]   = f32[o32];   arr[o+1] = f32[o32+1]; arr[o+2] = f32[o32+2];
+    arr[o+3] = f32[o32+3]; arr[o+4] = f32[o32+4]; arr[o+5] = f32[o32+5];
+    arr[o+6] = u8[o8+24]/255; arr[o+7] = u8[o8+25]/255;
+    arr[o+8] = u8[o8+26]/255; arr[o+9] = u8[o8+27]/255;
+    for (let k = 0; k < 4; k++) arr[o+10+k] = (u8[o8+28+k]-128)/128;
+  }
+  return arr;
+}
+const clouds = { makeup: null, bare: null, user: null };
+let active = null;                      // 当前已上传到 GPU 的点云键
+
+// 自动取景：用户重建点云的坐标系/尺度与合成脸不同，按包围球取景
+function cloudFrame(arr){
+  const n = arr.length / 14;
+  let sx = 0, sy = 0, sz = 0;
+  for (let i = 0; i < n; i++){
+    sx += arr[i*14]; sy += arr[i*14+1]; sz += arr[i*14+2];
+  }
+  const cx = sx/n, cy = sy/n, cz = sz/n;
+  const d = new Float32Array(n);
+  for (let i = 0; i < n; i++){
+    d[i] = Math.hypot(arr[i*14]-cx, arr[i*14+1]-cy, arr[i*14+2]-cz);
+  }
+  d.sort();
+  const r = d[Math.floor(n * 0.9)] || 0.5;      // 90 分位半径：抗远处漂浮点
+  return { target: [cx, cy, cz], dist: Math.max(r * 3.0, 0.4) };
+}
+const frames = { makeup: {target: [0,0,0], dist: 2.3}, bare: {target: [0,0,0], dist: 2.3} };
+
+function sortKeyOf(arr, n, view){
+  // 返回按视深升序（远→近）排列的实例索引
+  const B = 65536, minZ = -6, maxZ = 4;
+  const buckets = new Uint32Array(B + 1);
+  const keys = new Uint32Array(n);
+  for (let i = 0; i < n; i++){
+    const vz = view[2]*arr[i*14] + view[6]*arr[i*14+1] + view[10]*arr[i*14+2] + view[14];
+    let k = Math.floor((vz - minZ) / (maxZ - minZ) * B);
+    k = k < 0 ? 0 : (k > B-1 ? B-1 : k);
+    keys[i] = k; buckets[k+1]++;
+  }
+  for (let i = 0; i < B; i++) buckets[i+1] += buckets[i];
+  const order = new Uint32Array(n);
+  for (let i = 0; i < n; i++) order[buckets[keys[i]]++] = i;
+  return order;
+}
+const sortScratch = new Float32Array(0);
+let sortTimer = null;
+function uploadCloud(key){
+  const arr = clouds[key];
+  if (!arr) return;
+  const n = arr.length / 14;
+  const order = sortKeyOf(arr, n, matView());
+  let out = sortScratch;
+  if (out.length < arr.length) out = new Float32Array(arr.length);
+  for (let i = 0; i < n; i++){
+    const s = order[i]*14, t = i*14;
+    for (let k = 0; k < 14; k++) out[t+k] = arr[s+k];
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, out.subarray(0, arr.length), gl.DYNAMIC_DRAW);
+  active = key;
+  nActive = n;
+}
+let nActive = 0;
+function requestSort(){
+  if (sortTimer) return;
+  sortTimer = setTimeout(() => { sortTimer = null; uploadCloud(splitOn ? "makeup" : lastCloud); draw(); }, 30);
+}
+
+// ---- 相机 ----
+let yaw = 0, pitch = 0, dist = 2.3, spin = false, lastCloud = "makeup";
+const TARGET = [0, 0, 0];
+function matView(){
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const ex = TARGET[0] + dist * sy * cp, ey = TARGET[1] + dist * sp, ez = TARGET[2] + dist * cy * cp;
+  let fx = TARGET[0]-ex, fy = TARGET[1]-ey, fz = TARGET[2]-ez;
+  const fl = Math.hypot(fx,fy,fz); fx/=fl; fy/=fl; fz/=fl;
+  let rx = -fz, ry = 0, rz = fx;                                    // f × (0,1,0)
+  const rl = Math.hypot(rx,ry,rz) || 1; rx/=rl; ry/=rl; rz/=rl;
+  const ux = ry*fz - rz*fy, uy = rz*fx - rx*fz, uz = rx*fy - ry*fx; // up = r × f
+  return new Float32Array([
+    rx, ux, -fx, 0,
+    ry, uy, -fy, 0,
+    rz, uz, -fz, 0,
+    -(rx*ex+ry*ey+rz*ez), -(ux*ex+uy*ey+uz*ez), (fx*ex+fy*ey+fz*ez), 1
+  ]);
+}
+function matProj(){
+  const fov = 2*Math.atan(0.5/1.85);                 // 与内核 f=h*1.85 一致
+  const near = 0.05, far = 20;
+  const [w, h] = [canvas.width, canvas.height];
+  const t = 1/Math.tan(fov/2);
+  return new Float32Array([
+    t*(h/w), 0, 0, 0,
+    0, t, 0, 0,
+    0, 0, (far+near)/(near-far), -1,
+    0, 0, 2*far*near/(near-far), 0
+  ]);
+}
+
+// ---- 对比模式 ----
+let splitOn = false, splitX = 0.5;
+const divider = document.getElementById("divider");
+const splitlbl = document.getElementById("splitlbl");
+function setSplit(on){
+  splitOn = on;
+  document.getElementById("b-split").classList.toggle("on", on);
+  divider.style.display = splitlbl.style.display = on ? "block" : "none";
+  if (on) moveDivider(canvas.getBoundingClientRect().left + canvas.getBoundingClientRect().width/2);
+  uploadCloud("makeup"); draw();
+}
+document.getElementById("b-split").onclick = () => setSplit(!splitOn);
+function moveDivider(clientX){
+  const r = canvas.getBoundingClientRect();
+  splitX = Math.min(0.97, Math.max(0.03, (clientX - r.left) / r.width));
+  divider.style.left = (clientX - r.left) + "px";
+  draw();
+}
+canvas.addEventListener("pointerdown", e => { if (splitOn) moveDivider(e.clientX); });
+canvas.addEventListener("pointermove", e => { if (splitOn && (e.buttons & 1)) moveDivider(e.clientX); });
+
+// ---- 交互 ----
+let dragging = false, lx = 0, ly = 0;
+canvas.addEventListener("pointerdown", e => { dragging = true; lx = e.clientX; ly = e.clientY; canvas.classList.add("drag"); canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener("pointerup", () => { dragging = false; canvas.classList.remove("drag"); });
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  yaw += (e.clientX - lx) * 0.006;
+  pitch = Math.min(1.2, Math.max(-1.2, pitch + (e.clientY - ly) * 0.006));
+  lx = e.clientX; ly = e.clientY;
+  requestSort();
+});
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  dist = Math.min(8, Math.max(0.8, dist * (e.deltaY > 0 ? 1.1 : 0.9)));
+  requestSort();
+}, { passive: false });
+canvas.addEventListener("dblclick", () => {
+  const f = frames[lastCloud] || {target: [0,0,0], dist: 2.3};
+  yaw = 0; pitch = 0; dist = f.dist;
+  TARGET[0] = f.target[0]; TARGET[1] = f.target[1]; TARGET[2] = f.target[2];
+  requestSort();
+});
+
+function useCloud(key){
+  lastCloud = key;
+  const f = frames[key];
+  if (f){ TARGET[0] = f.target[0]; TARGET[1] = f.target[1]; TARGET[2] = f.target[2]; dist = f.dist; }
+  uploadCloud(key);
+  draw();
+}
+
+// ---- 我的3D脸（face3dgs 贴合结果，由 version.json 的 user 条目发布）----
+const bUser = document.getElementById("b-user");
+let userVer = "", userAutoShown = false;
+bUser.onclick = e => {
+  document.querySelectorAll("#bar button").forEach(b => { if (b.id !== "b-spin" && b.id !== "b-split") b.classList.remove("on"); });
+  e.target.classList.add("on");
+  useCloud("user");
+};
+
+const bFront = document.getElementById("b-front");
+const bThree = document.getElementById("b-three");
+const bSide = document.getElementById("b-side");
+const bSpin = document.getElementById("b-spin");
+const bSnap = document.getElementById("b-snap");
+
+// ---- 外部控制接口：Qt 侧边栏经 runJavaScript 调用（on 省略时为翻转）----
+const viewer3d = {
+  front: () => setView(0, 0, null),
+  three: () => setView(Math.PI/4.5, 0.08, null),
+  side:  () => setView(Math.PI/2.2, 0, null),
+  spin:  on => { spin = (on === undefined) ? !spin : !!on; bSpin.classList.toggle("on", spin); },
+  split: on => setSplit(on === undefined ? !splitOn : !!on),
+  snap:  () => bSnap.click(),
+  user:  () => { if (bUser.style.display !== "none") bUser.click(); }
+};
+window.viewer3d = viewer3d;
+
+// 内嵌到 Qt 主窗口时隐藏页内按钮条（控制已移至侧边栏）
+if (new URLSearchParams(location.search).has("embed")) document.getElementById("bar").style.display = "none";
+
+function setView(y, p, btn){
+  yaw = y; pitch = p;
+  document.querySelectorAll("#bar button").forEach(b => { if (b.id !== "b-spin" && b.id !== "b-split") b.classList.remove("on"); });
+  if (btn) btn.classList.add("on");
+  requestSort();
+}
+bFront.onclick = e => setView(0, 0, e.target);
+bThree.onclick = e => setView(Math.PI/4.5, 0.08, e.target);
+bSide.onclick = e => setView(Math.PI/2.2, 0, e.target);
+bSpin.onclick = () => viewer3d.spin();
+
+bSnap.onclick = () => {
+  draw();
+  canvas.toBlob(b => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(b);
+    a.download = "3dgs-makeup-" + Date.now() + ".png";
+    a.click();
+  });
+};
+
+// ---- 渲染 ----
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+gl.disable(gl.DEPTH_TEST);
+gl.clearColor(0.078, 0.071, 0.063, 1);
+
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(2, Math.floor(canvas.clientWidth * dpr));
+  const h = Math.max(2, Math.floor(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; }
+}
+function draw(){
+  resize();
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!clouds.makeup) return;
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  gl.uniformMatrix4fv(U.u_view, false, matView());
+  gl.uniformMatrix4fv(U.u_proj, false, matProj());
+  gl.uniform2f(U.u_viewport, canvas.width, canvas.height);
+  gl.uniform1f(U.u_split, splitX * canvas.width);
+  if (splitOn && clouds.bare){
+    if (active !== "bare") uploadCloud("bare");
+    gl.uniform1i(U.u_keep, 1);  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, nActive);
+    if (active !== "makeup") uploadCloud("makeup");
+    gl.uniform1i(U.u_keep, 2);  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, nActive);
+    lastCloud = "makeup";
+  } else {
+    if (active !== lastCloud) uploadCloud(lastCloud);
+    gl.uniform1i(U.u_keep, 0);  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, nActive);
+  }
+}
+function loop(){
+  if (spin){ yaw += 0.0035; requestSort(); }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---- 热更新：main 进程更新 version.json 后拉取新点云（保留相机状态）----
+const status = document.getElementById("status");
+let ver = "";
+async function poll(){
+  try{
+    const r = await fetch("/splat/version.json", { cache: "no-store" });
+    const j = await r.json();
+    if (j.version !== ver && j.ready){
+      ver = j.version;
+      const [mk, bare] = await Promise.all([
+        fetch("/splat/makeup.splat?t=" + ver, { cache: "no-store" }).then(r => r.arrayBuffer()),
+        fetch("/splat/bare.splat?t=" + ver, { cache: "no-store" }).then(r => r.arrayBuffer())
+      ]);
+      clouds.makeup = decodeSplat(mk);
+      clouds.bare = decodeSplat(bare);
+      uploadCloud(lastCloud);
+      status.textContent = `高斯点：妆容 ${clouds.makeup.length/14|0} · 素颜 ${clouds.bare.length/14|0}`;
+    }
+    if (j.user && j.user.version && j.user.version !== userVer){
+      userVer = j.user.version;
+      const buf = await fetch("/splat/" + j.user.file + "?t=" + userVer, { cache: "no-store" })
+        .then(r => r.arrayBuffer());
+      clouds.user = decodeSplat(buf);
+      frames.user = cloudFrame(clouds.user);
+      bUser.style.display = "";
+      bUser.textContent = `我的3D脸 ${(clouds.user.length/14|0).toLocaleString()}点`;
+      status.textContent = `我的3D脸已就绪：${(clouds.user.length/14|0).toLocaleString()} 点`;
+      if (!userAutoShown){ userAutoShown = true; bUser.click(); }
+    }
+  } catch(e){ status.textContent = "等待 3DGS 数据…"; }
+  setTimeout(poll, 1500);
+}
+poll();
+</script>
+</body>
+</html>

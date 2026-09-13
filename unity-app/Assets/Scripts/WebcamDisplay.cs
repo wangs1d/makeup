@@ -22,6 +22,10 @@ namespace MakeupMirror
         [Tooltip("镜像显示（照镜子习惯）。默认由主入口用相机投影翻转实现，这里保持 false")]
         public bool mirror = false;
         public int requestedCameraIndex = 0;
+        [Header("相机请求分辨率（设备不支持时由驱动降级）")]
+        public int requestedWidth = 1920;
+        public int requestedHeight = 1080;
+        public int requestedFps = 30;
 
         [Header("帧中继（发给 face_tracker --relay）")]
         public bool relayEnabled = true;
@@ -70,7 +74,7 @@ namespace MakeupMirror
                 return;
             }
             string name = WebCamTexture.devices[Mathf.Clamp(requestedCameraIndex, 0, WebCamTexture.devices.Length - 1)].name;
-            Texture = new WebCamTexture(name, 1280, 720, 30);
+            Texture = new WebCamTexture(name, requestedWidth, requestedHeight, requestedFps);
             Texture.Play();
             if (_mat != null)
             {
@@ -80,7 +84,7 @@ namespace MakeupMirror
             if (relayEnabled) _relay = new UdpClientRelay("127.0.0.1", relayPort);
             _lumTex = new Texture2D(32, 18, TextureFormat.RGBA32, false, true)
             { wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear };
-            Debug.Log($"[webcam] 使用摄像头：{name}（{WebCamTexture.devices.Length} 个可用）");
+            Debug.Log($"[webcam] 使用摄像头：{name}（请求 {requestedWidth}x{requestedHeight}，实际 {Texture.width}x{Texture.height}，{WebCamTexture.devices.Length} 个可用）");
         }
 
         private void OnDestroy()

@@ -170,6 +170,58 @@ warn/urgency 高的提醒与步骤完成播报，info 不播；设置开关与�
 
 ---
 
+## P5 真实用户脸部的 3DGS 化与妆容贴合 ✅（2026-09-12：face3dgs 包落地，管线与 ooosplat 对齐，81 项测试全过）
+
+取代 P2.3"合成网格溅射"的用户价值版本：不再对 canonical 假脸做还原度打磨，
+而是把用户本人的脸重建为 3DGS，再把妆容贴合到用户自己的点云上。技术路线与
+[ooolabdev/ooosplat](https://github.com/ooolabdev/ooosplat)（Apache-2.0）一致：
+FFmpeg 抽帧 → COLMAP 相机重建 → Brush 训练 → final.ply。
+
+### 5.1 采集引导（`face3dgs/capture.py`）
+单摄像头环绕采集：左/正/右三个偏航区间各 ≥2s 有效覆盖，MediaPipe 姿态 +
+光照/人脸占比质检实时反馈，产出 MP4 + 质量报告。纯逻辑类（帧进→状态出），
+Qt Tab 与 CLI 共用；将来搬浏览器端（getUserMedia）判定规则不变。
+
+### 5.2 重建编排（`face3dgs/reconstruct.py`）
+`ReconstructionBackend` 抽象：当前 `LocalEngineBackend` 编排本机引擎（发现规则与
+ooosplat 环境变量约定兼容）；**服务器部署时实现 `RemoteBackend` 即可整体上云**，
+采集/隔离/贴合零改动。命令模板可用 `OOOSPLAT_COLMAP_MAPPER_ARGS`/`OOOSPLAT_BRUSH_TRAIN_ARGS`
+覆盖，兼容引擎版本漂移。
+
+### 5.3 脸部隔离（`face3dgs/isolate.py` + `colmap_io.py`）
+全场景点云 → 脸部点云：各帧人脸框经 COLMAP 相机重投影投票（≥30% 含脸视角且 ≥2 票），
+叠加尺度离群"漂浮高斯"剔除。COLMAP sparse bin 最小读写自实现（零新依赖）。
+
+### 5.4 妆容贴合（`face3dgs/fit_makeup.py`）
+无 GPU 拟合的纯几何路线：多帧 2D 地标 + 相机位姿 DLT 三角化 → 468 个用户 3D 地标；
+canonical 脸模型（顶点与地标一一对应）带尺度 Procrustes 配准进 splat 世界系；
+splat 最近邻查 canonical UV → 复用 `RegionMasks.bake` 区域蒙版（形状参数与 App 完全一致）
+→ 非破坏式颜色混合（wrap-diffuse 光照，法线取自 splat 旋转）。产出 madeup.ply/.splat +
+前后对比预览。
+
+### 5.5 UI 与 CLI
+主窗口新增"③ 我的 3D 脸"标签页（采集→重建→贴合三步向导，引擎缺失给安装指引）；
+CLI：`py -m makeupstudio.face3dgs status|capture|rebuild|isolate|fit`。
+
+**验收**：`pytest tests/` 82 项全过（含 face3dgs 12 项：Mock 引擎跑通完整编排、合成 COLMAP
+数据验证投影/隔离/贴合几何）。**真机端到端实测**（2026-09-12，合成环绕视频 orbit2.mp4，
+640×536/120 帧/±55° 点阵背景）：
+- 引擎下载（gh-proxy 镜像分块）→ 引擎发现 → cv2 抽帧 → COLMAP → Brush 导出链路全部打通；
+- 脸部隔离：MediaPipe 检出 40/40 视角，13000 → 7618 个脸部 splat（背景点阵被正确投票剔除）；
+- 妆容贴合：40 帧地标三角化 + 鲁棒过滤（侧脸幻觉观测剔除，配准 RMSE 0.024 脸高），
+  date-rose 全妆（底妆/眉/眼影/眼线/腮红/唇釉）正确落到对应五官区域，前后对比预览生成
+  （`out/face3dgs/fitted/compare_*.png`）；
+- 本机遗留问题（2026-09-12 已解决）：换装 OOOSplat 0.4.0 自带引擎（`.engines/ooosplat/engines`，
+  `OOOSPLAT_ENGINE_DIR` 已 setx）后，COLMAP 换为官方 **4.0.4 CUDA 构建**（4.1.0.dev0）——
+  nocuda 几何验证全零不再复现（原生 mapper 正常，OpenCV 回退未触发）；Brush v0.3 训练退化
+  （46 splat）根因为 nocuda COLMAP 产出的稀疏输入质量，同一 Brush 二进制（sha256 与
+  OOOSplat 打包一致）+ CUDA COLMAP 稀疏后正常产出 107,251 splat（240 帧全链路 389s）。
+  顺带修复 `reconstruct.py` 特征提取旗标未跟随 COLMAP 4.x 改名的问题
+  （`--SiftExtraction.use_gpu` → `--FeatureExtraction.use_gpu`，先新后旧自适应，82 项测试全过）。
+另：顺带修复溅射合成预览三处还原度 bug（截断丢最近 splat、妆容层视差偏移、缺失锚点
+溅射层与轮廓软边），PSNR 13.6→22.2 dB；修复 tracker._pose 在 OpenCV 5 下的崩溃
+（solvePnP objectPoints 须为 (N,3)）——该 bug 影响实时化妆台的姿态估计。
+
 ## 长线（保持 README 路线图，依赖 P1/P2 铺垫）
 
 - **FLAME 3DMM 拟合**：P1 完成姿态/表情解耦后，把表情层从 468 点直驱升级为 FLAME

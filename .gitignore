@@ -19,3 +19,21 @@ Thumbs.db
 [Bb]uild/
 *.csproj
 *.sln
+
+# Local reconstruction engines (downloaded binaries)
+.engines/
+.engines-dl/
+
+# Accidental CLI output artifacts
+--output_path/
+
+# Third-party research clones
+research/
+
+# Desktop app build artifacts / downloaded models
+desktop-app/out/
+desktop-app/target/
+desktop-app/models/
+
+# Test caches
+.pytest_cache/
