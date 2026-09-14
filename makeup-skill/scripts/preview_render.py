@@ -21,9 +21,33 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-TEX = 512
+TEX = 512                     # 妆容/皮肤纹理边长（512 基准，get_renderer 按输出高度自适应提升）
+_TEX_BASE = 512               # 羽化/模糊等绝对像素常量的基准尺度
 FACE_HEIGHT_M = 0.22          # 真实脸高估计（米），溅射 sigma/offset 的米 → 世界单位换算
 REFS = Path(__file__).resolve().parent.parent / "references"
+
+
+def set_texture_size(n: int) -> None:
+    """设置纹理边长。须在烘焙/渲染前调用；get_renderer 会按输出高度自动设置。"""
+    global TEX
+    TEX = max(256, int(n))
+
+
+def auto_tex(h: int) -> int:
+    """输出高度 → 纹理边长：妆效纹理与屏幕像素接近 1:1，4K 下不再发糊。"""
+    if h <= 600:
+        return 512
+    if h <= 1152:
+        return 1024
+    if h <= 2304:
+        return 2048
+    return 4096
+
+
+def _ksize(px: float) -> tuple[int, int]:
+    """512 基准的模糊半径 → 当前 TEX 下的奇数卷积核。"""
+    k = max(1, int(round(px * TEX / _TEX_BASE)))
+    return (k | 1, k | 1)
 
 # ---------------- 环境光预设 ----------------
 
@@ -296,7 +320,7 @@ class RegionMasks:
         if feather > 0.0:
             dist = cv2.distanceTransform((cov > 0.05).astype(np.uint8), cv2.DIST_L2, 5)
             cov = cov * np.clip(dist / feather, 0, 1).astype(np.float32)
-        cov = cv2.GaussianBlur(cov, (5, 5), 0)
+        cov = cv2.GaussianBlur(cov, _ksize(5), 0)
         # 向心度：区域中心 1 → 边缘 0（渐变色带取色）
         dist_c = cv2.distanceTransform((cov > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
         dmax = dist_c.max()
@@ -304,7 +328,7 @@ class RegionMasks:
         return np.stack([cov, cent], axis=-1)
 
 
-# 各部位羽化基准宽度（像素，512 UV 尺度）；实际 = 基准 × (0.5 + falloff)。
+# 各部位羽化基准宽度（像素，512 UV 基准；实际 = 基准 × (0.5 + falloff) × TEX/512）。
 # 0 = 细线条（眉/眼线/睫毛）不做距离衰减，只抗锯齿，否则 1~3px 的线会被侵蚀。
 FEATHER_PX = {
     "foundation": 10.0, "concealer": 20.0, "contour": 16.0, "eyebrow": 0.0,
@@ -319,7 +343,7 @@ def feather_px(region: str, shape: dict, falloff: float) -> float:
         base = 3.0 + float(shape.get("blur", 0.15) or 0.0) * 30.0     # 咬唇妆 blur 调大
     if base <= 0.0:
         return 0.0
-    return base * (0.5 + min(max(falloff, 0.0), 1.0))
+    return base * (0.5 + min(max(falloff, 0.0), 1.0)) * (TEX / _TEX_BASE)
 
 
 def sample_ramp(stops: list[dict], t: np.ndarray) -> np.ndarray:
@@ -342,6 +366,11 @@ def _hex(h: str) -> np.ndarray:
     return np.array([int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)], np.float32) / 255.0
 
 
+def _cross2(ax, ay, bx, by):
+    """2D 叉积（numpy 2.x 移除了 np.cross 的 2D 支持）。"""
+    return ax * by - ay * bx
+
+
 # ---------------- 纹理烘焙 ----------------
 
 def bake_skin(regions: RegionMasks) -> np.ndarray:
@@ -353,7 +382,7 @@ def bake_skin(regions: RegionMasks) -> np.ndarray:
         c = np.zeros((TEX, TEX), np.float32)
         pts = regions._pts(group)
         cv2.fillPoly(c, [np.round(pts).astype(np.int32)], 1.0)
-        return cv2.GaussianBlur(c, (blur * 2 + 1, blur * 2 + 1), 0)
+        return cv2.GaussianBlur(c, _ksize(blur * 2 + 1), 0)
 
     base = np.zeros((TEX, TEX, 3), np.float32)
     base[:] = (0.925, 0.776, 0.678)                      # 暖肤底色
@@ -375,7 +404,7 @@ def bake_skin(regions: RegionMasks) -> np.ndarray:
         r = np.zeros((TEX, TEX), np.float32)
         cv2.ellipse(r, (int(c[0]), int(c[1])), (int(0.12 * TEX), int(0.15 * TEX)),
                     ang, 0, 360, 1.0, -1)
-        r = cv2.GaussianBlur(r, (49, 49), 0) * 0.22
+        r = cv2.GaussianBlur(r, _ksize(49), 0) * 0.22
         base += r[..., None] * np.array([0.10, 0.02, 0.01])
 
     rng = np.random.default_rng(7)
@@ -443,9 +472,11 @@ def _bilinear(img: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
 # ---------------- 渲染器 ----------------
 
 class FaceRenderer:
-    def __init__(self, w: int, h: int, obj_path=None, regions_json=None):
+    def __init__(self, w: int, h: int, obj_path=None, regions_json=None, tex: int | None = None):
         obj_path = obj_path or (REFS / "canonical_face_model.obj")
         regions_json = regions_json or (REFS / "landmark-regions.json")
+        self.tex = int(tex) if tex else auto_tex(h)
+        set_texture_size(self.tex)                     # 烘焙须在目标纹理尺度下进行
         self.model = FaceModel(obj_path)
         self.model.prepare(regions_json, obj_path)
         self.regions = RegionMasks(regions_json, obj_path)
@@ -463,10 +494,11 @@ class FaceRenderer:
         oval = np.zeros((TEX, TEX), np.float32)
         cv2.fillPoly(oval, [np.round(self.regions._pts("foundation_face_oval")).astype(np.int32)], 1.0)
         dist = cv2.distanceTransform((oval > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
-        return np.clip(dist / 26.0, 0, 1).astype(np.float32)
+        return np.clip(dist / (26.0 * TEX / _TEX_BASE), 0, 1).astype(np.float32)
 
     def makeup_for(self, key: str, layers: list[dict]):
         if key not in self._cache:
+            set_texture_size(self.tex)
             self._cache[key] = bake_makeup(layers, self.regions)
         return self._cache[key]
 
@@ -479,6 +511,7 @@ class FaceRenderer:
                prev_makeup=None, fade_w: float = 1.0, intensity: float = 1.0,
                splat_layers: list[dict] | None = None, presence: float = 1.0) -> np.ndarray:
         """返回 (h, w, 3) BGR uint8 视口画面。presence<1 时妆容整体淡出。"""
+        set_texture_size(self.tex)                   # _bilinear/纹理坐标依赖全局 TEX
         W, H = self.w, self.h
         mouth = max(0.0, float(np.sin(2 * np.pi * t / 6.0))) ** 2 * 0.55
         smile = 0.5 + 0.5 * np.sin(2 * np.pi * t / 12.0 + 2.0)
@@ -500,7 +533,8 @@ class FaceRenderer:
         # 三角形光栅化（背面剔除 + zbuffer）
         tris = self.model.tris
         p0, p1, p2 = P2[tris[:, 0]], P2[tris[:, 1]], P2[tris[:, 2]]
-        fnz = np.cross(p1 - p0, p2 - p0)            # 屏幕绕向
+        fnz = _cross2(p1[..., 0] - p0[..., 0], p1[..., 1] - p0[..., 1],
+                      p2[..., 0] - p0[..., 0], p2[..., 1] - p0[..., 1])
         keep = fnz < 0                               # 正面
         for ti in np.nonzero(keep)[0]:
             self._raster(ti, tris, P2, V, N, depth, zbuf, cbuf,
@@ -516,6 +550,7 @@ class FaceRenderer:
                      yaw_deg: float = 0.0, smile: float = 0.12,
                      splat_layers: list[dict] | None = None) -> np.ndarray:
         """静态正脸（或指定偏航角）渲染——参考图/预览用。"""
+        set_texture_size(self.tex)
         V = self.model.pose_explicit(yaw_deg, -2.0, 0.0, 0.03, smile)
         N = self.model.vertex_normals(V)
         W, H = self.w, self.h
@@ -532,7 +567,8 @@ class FaceRenderer:
             mk = self.makeup_for(key, layers)
         tris = self.model.tris
         p0, p1, p2 = P2[tris[:, 0]], P2[tris[:, 1]], P2[tris[:, 2]]
-        keep = np.cross(p1 - p0, p2 - p0) < 0
+        keep = _cross2(p1[..., 0] - p0[..., 0], p1[..., 1] - p0[..., 1],
+                       p2[..., 0] - p0[..., 0], p2[..., 1] - p0[..., 1]) < 0
         for ti in np.nonzero(keep)[0]:
             self._raster(ti, tris, P2, V, N, depth, zbuf, cbuf, mk, None, 1.0, intensity, 1.0)
         canvas = np.where(zbuf[..., None] < 1e8, cbuf, canvas)
@@ -812,11 +848,75 @@ def _ramp_hex(stops, t):
 _renderer_cache: dict = {}
 
 
-def get_renderer(w: int = 640, h: int = 538) -> FaceRenderer:
-    key = (w, h)
+def get_renderer(w: int = 640, h: int = 538, tex: int | None = None) -> FaceRenderer:
+    tex = int(tex) if tex else auto_tex(h)
+    key = (w, h, tex)
     if key not in _renderer_cache:
-        _renderer_cache[key] = FaceRenderer(w, h)
+        _renderer_cache[key] = FaceRenderer(w, h, tex=tex)
+    set_texture_size(tex)                        # 混用多种渲染尺寸时保持全局 TEX 一致
     return _renderer_cache[key]
+
+
+class _FfmpegVideoWriter:
+    """ffmpeg 管道写出器：libx264 CRF 恒定质量（4K 清晰度可控、体积远小于全 I 帧）。"""
+
+    def __init__(self, out_path: str | Path, fps: float, size: tuple[int, int], crf: int = 17):
+        import shutil
+        import subprocess
+        exe = None
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            exe = shutil.which("ffmpeg")
+        if exe is None:
+            raise RuntimeError("ffmpeg 不可用")
+        w, h = size
+        self._proc = subprocess.Popen(
+            [exe, "-y", "-loglevel", "error", "-f", "rawvideo", "-vcodec", "rawvideo",
+             "-s", f"{w}x{h}", "-pix_fmt", "bgr24", "-r", str(fps), "-i", "-",
+             "-an", "-vcodec", "libx264", "-preset", "medium", "-crf", str(crf),
+             "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def isOpened(self) -> bool:
+        return self._proc.poll() is None
+
+    def write(self, frame: np.ndarray) -> bool:
+        try:
+            self._proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            return True
+        except Exception:
+            return False
+
+    def release(self) -> None:
+        try:
+            self._proc.stdin.close()
+            self._proc.wait(timeout=120)
+        except Exception:
+            self._proc.kill()
+
+    def set(self, *_args) -> None:
+        pass
+
+
+def open_video_writer(out_path: str | Path, fps: float,
+                      size: tuple[int, int]) -> "cv2.VideoWriter | _FfmpegVideoWriter":
+    """创建 MP4 写出器：优先 ffmpeg/libx264（CRF 17 视觉无损），回退 OpenCV H.264/mp4v。"""
+    try:
+        return _FfmpegVideoWriter(out_path, fps, size)
+    except Exception:
+        pass
+    for cc in ("avc1", "H264", "mp4v"):
+        vw = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*cc), fps, size)
+        if vw.isOpened():
+            try:
+                vw.set(cv2.VIDEOWRITER_PROP_QUALITY, 100)
+            except Exception:
+                pass
+            return vw
+        vw.release()
+    raise RuntimeError(f"无法创建视频: {out_path}")
 
 
 def render_reference(spec: dict, out_path: str | Path | None = None, size: int = 640,

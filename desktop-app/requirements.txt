@@ -1,0 +1,13 @@
+PySide6>=6.6
+opencv-python>=4.8
+mediapipe>=1.0
+numpy
+pillow
+websockets
+imageio-ffmpeg  # 可选：open_video_writer 用 libx264 CRF 编码（缺失时回退 OpenCV avc1）
+
+# --- 可选：像素级人脸解析（唇/皮肤蒙版；缺省时自动回退 landmark 蒙版） ---
+# torch 建议 GPU 版（pytorch.org 选 CUDA wheel）；CPU 也能跑（解析 ~3.6Hz + 帧间对齐）
+# torch>=2.0
+# transformers>=4.40
+# 权重首次运行自动从 hf-mirror.com 下载（jonathandinu/face-parsing ~50MB，缓存后离线加载）

@@ -11,5 +11,5 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "makeup-skill" / "scripts"))
 from preview_render import (  # noqa: E402,F401
     ENVS, FACE_HEIGHT_M, TEX, FaceModel, FaceRenderer, bake_makeup, bake_skin, build_splats,
-    render_reference,
+    open_video_writer, render_reference,
 )

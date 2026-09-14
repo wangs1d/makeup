@@ -22,18 +22,28 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from face_render import ENVS, FaceRenderer, build_splats  # noqa: E402
+from face_render import ENVS, FaceRenderer, build_splats, open_video_writer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 STREAM = ROOT / "unity-app" / "Assets" / "StreamingAssets"
 EVENTS = Path(__file__).resolve().parent / "events.json"
 
-W, H = 1280, 720
-VX, VY, VW, VH = 24, 24, 800, 672            # 镜像视口
-PX, PW = 848, 408                             # 右侧面板
-RENDER_SCALE = 0.8                            # 内部渲染分辨率比例（提速）
+SCALE = 3                                     # 输出分辨率倍率：1=720p · 2=1440p · 3=4K UHD（默认）
+W, H = 1280 * SCALE, 720 * SCALE
+VX, VY, VW, VH = 24 * SCALE, 24 * SCALE, 800 * SCALE, 672 * SCALE   # 镜像视口
+PX, PW = 848 * SCALE, 408 * SCALE             # 右侧面板
+RENDER_SCALE = 1.0                            # 内部渲染分辨率比例（SCALE>=3 时 1:1 渲染）
 FPS_DEFAULT = 24
 FADE_S = 0.6
+
+
+def set_scale(s: int) -> None:
+    """按倍率重算全部布局常量（720p 基准 1280×720）。"""
+    global W, H, VX, VY, VW, VH, PX, PW, RENDER_SCALE
+    W, H = 1280 * s, 720 * s
+    VX, VY, VW, VH = 24 * s, 24 * s, 800 * s, 672 * s
+    PX, PW = 848 * s, 408 * s
+    RENDER_SCALE = 1.0 if s >= 3 else 0.8
 
 CN = {"foundation": "粉底", "concealer": "遮瑕", "contour": "修容", "eyebrow": "眉",
       "eyeshadow": "眼影", "eyeliner": "眼线", "lashes": "睫毛", "blush": "腮红",
@@ -155,18 +165,19 @@ def glyph_safe(text: str) -> str:
 
 def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
             spec_name: str | None, env: str) -> np.ndarray:
+    S = SCALE
     img = Image.fromarray(frame_bgr[..., ::-1]).convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(overlay)
-    f_s, f_m, f_l = font(20), font(24), font(30)
+    f_s, f_m, f_l = font(20 * S), font(24 * S), font(30 * S)
 
     # 右侧面板
     d.rectangle([PX, 0, W, H], fill=BG_PANEL)
-    d.text((PX + 24, 26), "Agent 实时会话", font=f_l, fill=FG)
-    d.text((PX + 24, 66), "bridge 1.1 · 精确路由 · 资产 HTTP 侧车", font=f_s, fill=FG_DIM)
-    d.line([PX + 20, 104, W - 20, 104], fill=(60, 64, 74, 255), width=2)
+    d.text((PX + 24 * S, 26 * S), "Agent 实时会话", font=f_l, fill=FG)
+    d.text((PX + 24 * S, 66 * S), "bridge 1.1 · 精确路由 · 资产 HTTP 侧车", font=f_s, fill=FG_DIM)
+    d.line([PX + 20 * S, 104 * S, W - 20 * S, 104 * S], fill=(60, 64, 74, 255), width=2 * S)
 
-    y = 124
+    y = 124 * S
     bubbles = tl.bubbles(t)
     in_coach = COACH_WINDOW[0] <= t <= COACH_WINDOW[1]
     if in_coach:
@@ -175,43 +186,45 @@ def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
         who = "agent" if is_note else "coach"
         text = glyph_safe(text)
         col = ACCENT if is_note else (WARN if prio == "warn" else (120, 200, 255, 255))
-        d.text((PX + 24, y), f"{who} · {bt:5.1f}s", font=f_s, fill=col)
-        y += 28
+        d.text((PX + 24 * S, y), f"{who} · {bt:5.1f}s", font=f_s, fill=col)
+        y += 28 * S
         line, lines = "", []
         for ch in text:
-            if d.textlength(line + ch, font=f_m) > PW - 72:
+            if d.textlength(line + ch, font=f_m) > (PW - 72) * S:
                 lines.append(line)
                 line = ch
             else:
                 line += ch
         if line:
             lines.append(line)
-        hgt = len(lines) * 30 + 18
-        rounded(d, [PX + 20, y, W - 20, y + hgt], 10, fill=(38, 42, 52, 255))
+        hgt = len(lines) * 30 * S + 18 * S
+        rounded(d, [PX + 20 * S, y, W - 20 * S, y + hgt], 10 * S, fill=(38, 42, 52, 255))
         for i, ln in enumerate(lines):
-            d.text((PX + 34, y + 8 + i * 30), ln, font=f_m, fill=FG)
-        y += hgt + 14
-        if y > H - 150:
+            d.text((PX + 34 * S, y + 8 * S + i * 30 * S), ln, font=f_m, fill=FG)
+        y += hgt + 14 * S
+        if y > H - 150 * S:
             break
 
     # 镜像视口边框 + 状态栏
-    rounded(d, [VX - 2, VY - 2, VX + VW + 2, VY + VH + 2], 14,
-            outline=(70, 74, 86, 255), width=3)
-    d.rectangle([VX + 14, VY + 12, VX + 14 + 12, VY + 24], fill=GREEN)
-    d.text((VX + 38, VY + 10), "bridge: connected", font=f_s, fill=FG)
-    d.text((VX + 220, VY + 10), f"tracking: ok · 30 fps · 468 pts · pose √ · env {env}", font=f_s, fill=FG)
-    d.text((VX + VW - 16, VY + VH - 34), "Python 预览渲染（Unity App 同管线：蒙版/溅射/光照）",
-           font=font(18), fill=(200, 202, 210, 200), anchor="ra")
+    rounded(d, [VX - 2 * S, VY - 2 * S, VX + VW + 2 * S, VY + VH + 2 * S], 14 * S,
+            outline=(70, 74, 86, 255), width=3 * S)
+    d.rectangle([VX + 14 * S, VY + 12 * S, VX + (14 + 12) * S, VY + 24 * S], fill=GREEN)
+    d.text((VX + 38 * S, VY + 10 * S), "bridge: connected", font=f_s, fill=FG)
+    d.text((VX + 220 * S, VY + 10 * S), f"tracking: ok · 30 fps · 468 pts · pose √ · env {env}",
+           font=f_s, fill=FG)
+    d.text((VX + VW - 16 * S, VY + VH - 34 * S), "Python 预览渲染（Unity App 同管线：蒙版/溅射/光照）",
+           font=font(18 * S), fill=(200, 202, 210, 200), anchor="ra")
 
     # 强度滑杆
-    sx0, sy = VX + 24, VY + VH - 66
-    d.text((sx0, sy - 34), f"妆感 {int(intensity * 100)}%", font=f_m, fill=FG)
-    rounded(d, [sx0, sy, sx0 + 320, sy + 14], 7, fill=(52, 56, 66, 255))
-    rounded(d, [sx0, sy, sx0 + int(320 * intensity), sy + 14], 7, fill=ACCENT)
-    d.ellipse([sx0 + int(320 * intensity) - 12, sy - 5,
-               sx0 + int(320 * intensity) + 12, sy + 19], fill=(245, 245, 248, 255))
+    sx0, sy = VX + 24 * S, VY + VH - 66 * S
+    d.text((sx0, sy - 34 * S), f"妆感 {int(intensity * 100)}%", font=f_m, fill=FG)
+    rounded(d, [sx0, sy, sx0 + 320 * S, sy + 14 * S], 7 * S, fill=(52, 56, 66, 255))
+    rounded(d, [sx0, sy, sx0 + int(320 * S * intensity), sy + 14 * S], 7 * S, fill=ACCENT)
+    d.ellipse([sx0 + int(320 * S * intensity) - 12 * S, sy - 5 * S,
+               sx0 + int(320 * S * intensity) + 12 * S, sy + 19 * S],
+              fill=(245, 245, 248, 255))
     if spec_name:
-        d.text((sx0 + 150, sy - 34), f"当前妆容：{spec_name}", font=f_s, fill=FG_DIM)
+        d.text((sx0 + 150 * S, sy - 34 * S), f"当前妆容：{spec_name}", font=f_s, fill=FG_DIM)
 
     # 教练大字幕（视口底部居中）
     coach = tl.active_coach(t)
@@ -219,23 +232,27 @@ def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
         text, prio, prog = coach
         alpha = int(255 * min(1.0, (1 - prog) * 3) if prog > 0.8 else 255)
         col = WARN if prio == "warn" else (255, 255, 255, alpha)
-        d.text((VX + VW // 2, VY + VH - 118), glyph_safe(text), font=font(28), fill=col, anchor="mm")
+        d.text((VX + VW // 2, VY + VH - 118 * S), glyph_safe(text),
+               font=font(28 * S), fill=col, anchor="mm")
 
     # 步骤进度条（指导章节期间，由 coaching 消息的 step/steps/progress 驱动）
     if in_coach:
         pr = tl.progress_at(t)
-        x0, y0 = PX + 24, H - 58
-        rounded(d, [PX + 12, y0 - 48, W - 12, y0 + 30], 10, fill=(16, 17, 22, 220))
-        d.text((x0, y0 - 36), "化妆步骤（live_coach 推送）", font=font(18), fill=FG_DIM)
+        x0, y0 = PX + 24 * S, H - 58 * S
+        rounded(d, [PX + 12 * S, y0 - 48 * S, W - 12 * S, y0 + 30 * S], 10 * S,
+                fill=(16, 17, 22, 220))
+        d.text((x0, y0 - 36 * S), "化妆步骤（live_coach 推送）", font=font(18 * S), fill=FG_DIM)
         if pr:
             step, steps, name, progress = pr
-            d.text((x0, y0 - 6), f"步骤 {step}/{steps} · {name} · {int(progress * 100)}%", font=f_m, fill=FG)
-            bw = PW - 48
-            rounded(d, [x0, y0 + 20, x0 + bw, y0 + 28], 4, fill=(52, 56, 66, 255))
+            d.text((x0, y0 - 6 * S), f"步骤 {step}/{steps} · {name} · {int(progress * 100)}%",
+                   font=f_m, fill=FG)
+            bw = PW - 48 * S
+            rounded(d, [x0, y0 + 20 * S, x0 + bw, y0 + 28 * S], 4 * S, fill=(52, 56, 66, 255))
             done_w = int(bw * ((step - 1 + progress) / max(steps, 1)))
-            rounded(d, [x0, y0 + 20, x0 + max(done_w, 4), y0 + 28], 4, fill=GREEN if progress >= 1 else ACCENT)
+            rounded(d, [x0, y0 + 20 * S, x0 + max(done_w, 4 * S), y0 + 28 * S], 4 * S,
+                    fill=GREEN if progress >= 1 else ACCENT)
         else:
-            d.text((x0, y0 - 6), "正在生成目标妆参考图 …", font=f_m, fill=FG_DIM)
+            d.text((x0, y0 - 6 * S), "正在生成目标妆参考图 …", font=f_m, fill=FG_DIM)
 
     # 章节字幕
     for t0, t1, text in CHAPTERS:
@@ -243,9 +260,10 @@ def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
             fade = min(1.0, (t - t0) / 0.4, (t1 - t) / 0.4)
             a = int(230 * max(0, fade))
             tw = d.textlength(text, font=f_l)
-            rounded(d, [VX + VW // 2 - tw / 2 - 18, VY + 18,
-                        VX + VW // 2 + tw / 2 + 18, VY + 64], 10, fill=(10, 10, 14, a))
-            d.text((VX + VW // 2, VY + 41), text, font=f_l, fill=(255, 255, 255, a), anchor="mm")
+            rounded(d, [VX + VW // 2 - tw / 2 - 18 * S, VY + 18 * S,
+                        VX + VW // 2 + tw / 2 + 18 * S, VY + 64 * S], 10 * S,
+                    fill=(10, 10, 14, a))
+            d.text((VX + VW // 2, VY + 41 * S), text, font=f_l, fill=(255, 255, 255, a), anchor="mm")
             break
 
     # 结尾卡
@@ -253,16 +271,17 @@ def draw_ui(frame_bgr: np.ndarray, tl: Timeline, t: float, intensity: float,
         a = int(min(1.0, (t - END_CARD_T) / 0.8) * 235)
         d.rectangle([0, 0, W, H], fill=(12, 12, 16, a))
         if a > 40:
-            d.text((W // 2, 200), "化妆助手 · 三大能力", font=font(40), fill=FG, anchor="mm")
+            d.text((W // 2, 200 * S), "化妆助手 · 三大能力", font=font(40 * S), fill=FG, anchor="mm")
             for i, line in enumerate([
                     "①  选妆试妆 —— 6DoF 姿态贴脸、环境光合成、高斯溅射唇釉",
                     "②  妆容素材解析 —— 上传照片/视频，VLM 解析成同款 + 效果预览图",
                     "③  实时化妆协助 —— 目标妆参考图视觉对比、滑窗防抖、进度/评分/语音"]):
-                d.text((W // 2, 300 + i * 56), line, font=font(26), fill=(210, 214, 222, a),
-                       anchor="mm")
-            d.text((W // 2, 510), "本视频为真实 Bridge 协议会话的离线复现（无 VLM key，指导为 live_coach --test 离线剧本）",
+                d.text((W // 2, (300 + i * 56) * S), line, font=font(26 * S),
+                       fill=(210, 214, 222, a), anchor="mm")
+            d.text((W // 2, 510 * S),
+                   "本视频为真实 Bridge 协议会话的离线复现（无 VLM key，指导为 live_coach --test 离线剧本）",
                    font=f_s, fill=(150, 155, 165, a), anchor="mm")
-            d.text((W // 2, 542), "makeup-skill/ ── SKILL.md 能力包 · unity-app/ ── Unity 试妆 App",
+            d.text((W // 2, 542 * S), "makeup-skill/ ── SKILL.md 能力包 · unity-app/ ── Unity 试妆 App",
                    font=f_s, fill=(150, 155, 165, a), anchor="mm")
 
     return np.asarray(Image.alpha_composite(img, overlay).convert("RGB"))[..., ::-1].copy()
@@ -279,7 +298,10 @@ def main() -> None:
     ap.add_argument("--env", default="warm", choices=sorted(ENVS), help="环境光预设")
     ap.add_argument("--duration", type=float, default=0, help="只渲染前 N 秒（0=全部，调试用）")
     ap.add_argument("--start", type=float, default=0, help="从第 N 秒开始渲染（调试用）")
+    ap.add_argument("--scale", type=int, default=SCALE, choices=(1, 2, 3),
+                    help="输出分辨率倍率：1=720p · 2=1440p · 3=4K UHD（默认）")
     args = ap.parse_args()
+    set_scale(args.scale)
 
     data = json.loads(EVENTS.read_text(encoding="utf-8"))
     tl = Timeline(data)
@@ -288,6 +310,8 @@ def main() -> None:
     renderer = FaceRenderer(int(VW * RENDER_SCALE), int(VH * RENDER_SCALE),
                             STREAM / "canonical_face_model.obj",
                             STREAM / "landmark-regions.json")
+    print(f"[render] 输出 {W}x{H}（scale={args.scale}），内部渲染 {VW * RENDER_SCALE:.0f}x{VH * RENDER_SCALE:.0f}，"
+          f"妆效纹理 {renderer.tex}px", flush=True)
     renderer.set_env(args.env)
     tex_cache: dict = {}
 
@@ -298,9 +322,7 @@ def main() -> None:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    vw = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (W, H))
-    if not vw.isOpened():
-        raise SystemExit("VideoWriter 打开失败")
+    vw = open_video_writer(str(out_path), args.fps, (W, H))
 
     n_frames = int((duration - args.start) * args.fps)
     t_start = time.time()
