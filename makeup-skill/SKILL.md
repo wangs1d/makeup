@@ -13,9 +13,9 @@ description: >
 
 ## 三大能力
 
-1. **选妆试妆** — 用户选择一个妆容（内置预设或解析生成的），通过摄像头实时看到自己"化完妆"的样子，转头时妆容跟随脸部。
-2. **解析妆容素材** — 用户上传目标妆容的照片/视频（博主视频、截图、自拍），解析成结构化妆容规格 `makeup_spec.json`，可直接用于试妆。
-3. **实时化妆协助** — 化妆过程中，周期性采样摄像头帧，对比目标妆容与用户当前妆面，给出下一步动作提醒（如"左眼影向外晕染""口红内侧补色"），提示实时显示在 App 上。
+1. **画像试妆（默认流程）** — 用户上传 3DGS 画像，选妆容在画像上实时预览（真高斯溅射渲染），确认后进入**妆容台**辅助化妆。真脸上不渲染任何妆容。
+2. **解析妆容素材** — 用户上传目标妆容的照片/视频（博主视频、截图、自拍），解析成结构化妆容规格 `makeup_spec.json`，可直接用于画像试妆。
+3. **实时化妆协助** — 化妆过程中，周期性采样摄像头帧，对比目标妆容与用户当前妆面，给出下一步动作提醒（如"左眼影向外晕染""口红内侧补色"），提示实时显示在 App 上。（legacy：真脸 AR 附妆试妆保留在 App 的 `legacyFaceMakeup` 开关后）
 
 ## 前置检查（每次会话开始时先执行）
 
@@ -43,9 +43,54 @@ python <skill_dir>/scripts/setup_check.py
 
 可换成任何 OpenAI 兼容服务商（如 `https://api.openai.com/v1` + `gpt-4o`）。
 
-## 工作流一：选妆试妆
+## 工作流〇：画像试妆 + 妆容台（默认流程）
 
-前置：Bridge 运行中 + App 已连接。不需要 VLM。
+前置：Bridge 运行中（必须含资产 HTTP 侧车，默认开启）+ App 已连接。试妆预览不需要 VLM。
+
+流程：**用户上传 3DGS 画像 → 选妆在画像上预览 → 用户确认 → 进妆容台辅助化妆**。
+妆容只渲染在画像上（真 3DGS 高斯溅射），摄像头里的真脸零附着；画像获取与语义锚点见
+`references/avatar-setup.md`。
+
+1. **注册画像**（用户提供 ply 文件后）：
+
+```bash
+python <skill_dir>/scripts/avatar_session.py register --ply <画像.ply> --name 我的画像
+```
+
+   自动归一化（居中+脸高=1）并抽稀到 12 万高斯，经 HTTP 侧车上传给 App 渲染。
+
+2. **选妆预览**（把 `compiled/<look>/preview.jpg` 并排图给用户看，附各部位色号说明）：
+
+```bash
+python <skill_dir>/scripts/avatar_session.py preview --avatar 我的画像 --spec <skill_dir>/presets/date-rose.json
+```
+
+   - 单品改妆（用户说"只换口红"）：加 `--only lipstick`，其余部位清零重编译；
+   - 换色号：改 spec 里对应 layer 的 `color_stops` 后重跑 preview（tint 按 region 索引，秒级）；
+   - 语义标注首次自动（正脸渲染+MediaPipe 反投影），结果缓存；失败时按
+     avatar-setup.md 给手动锚点 `--anchors anchors.json`。
+
+3. **确认 + 进妆容台**（用户满意后）：
+
+```bash
+python <skill_dir>/scripts/avatar_session.py confirm --avatar 我的画像
+python <skill_dir>/scripts/avatar_session.py station --avatar 我的画像
+```
+
+   App 进入妆容台布局：画像移到侧栏作目标参照，摄像头画面保留供取帧，指导字幕/进度条/语音全开。
+
+4. **辅助化妆**：工作流三照常，但加 `--station`（开始/结束联动妆容台）与
+   `--avatar-look <compiled目录>`（VLM 参考图改用画像渲染效果）：
+
+```bash
+python <skill_dir>/scripts/live_coach.py --spec <妆容spec> --station \
+    --avatar-look out/avatars/我的画像/compiled/date-rose
+```
+
+## 工作流一：选妆试妆（legacy 真脸链路）
+
+前置：Bridge 运行中 + App 已连接。不需要 VLM。（legacy：需要 App 开 `legacyFaceMakeup`；
+默认画像流程走工作流〇）
 
 1. 列出可选妆容：读取 `<skill_dir>/presets/*.json` 的 `name` 和 `description` 字段向用户展示；若之前解析过用户的妆容素材，也一并列出（见工作流四的产出目录）。
 2. 用户选定后下发：
@@ -61,6 +106,34 @@ python <skill_dir>/scripts/apply_spec.py --spec <skill_dir>/presets/daily-natura
    - 多个试妆 App 在线时定向下发：`--to <client_id>`（client_id 见 status）
    - 卸妆还原：`python <skill_dir>/scripts/apply_spec.py --clear`
 4. 完成后告知用户 App 里可拖动强度滑杆微调；确认用户满意即结束。
+
+### 自然语言改妆（工作流一变体）
+
+用户已上妆后说"口红换成番茄色""眼影淡一点"这类一句话改妆需求时，不必重选整个妆容：
+agent 直接改 spec 中对应 layer 的字段，再配合 `--only` 单层下发（其余部位保持不变）。
+
+以"口红换番茄色"为例（把当前 spec 复制到工作目录后，将 lipstick layer 的
+`color_stops` 两个 hex 改为番茄色系，如 `#D93A2B` / `#B32B1F`，`finish` 可改 `gloss`）：
+
+```bash
+# 1. 复制当前 spec 到工作目录并编辑 lipstick layer 的颜色字段
+cp <skill_dir>/presets/daily-natural.json <工作目录>/makeup_spec.json
+#    （编辑 spec：layers 里 region == "lipstick" 的层，改 color_stops 的 hex）
+# 2. 只下发改过的口红层，脸上其余妆容不动
+python <skill_dir>/scripts/apply_spec.py --spec <工作目录>/makeup_spec.json --only lipstick --bake
+```
+
+常见改妆映射（字段见 `references/schema.md`）：
+
+| 用户说 | 改哪个字段 |
+|---|---|
+| 换色号 / 换颜色 | 对应 layer 的 `color_stops[*].hex`（常改动两侧渐变两档） |
+| 浓一点 / 淡一点 | layer 的 `opacity`，或整体用 `--intensity` |
+| 哑光 / 水光 | layer 的 `finish`（`matte` / `satin` / `gloss` / `dewy`） |
+| 眼影范围大一点 | `shape.spread` / `shape.height` |
+| 眼线加个小尾巴 | `shape.wing`（0~1） |
+
+注意：左右各一个 layer 的 region（eyeshadow/blush）要两侧同时改，保持对称。
 
 ## 工作流二：解析妆容素材（照片/视频 → 同款妆容）
 
@@ -86,6 +159,7 @@ python <skill_dir>/scripts/parse_look.py --input <素材路径> --out <工作目
 ## 工作流三：实时化妆协助
 
 前置：Bridge 运行中 + App 已连接（App 会回传摄像头帧）+ VLM 已配置。
+画像流程（推荐）：`--station` 进妆容台 + `--avatar-look` 用画像渲染作参考图。
 
 ```bash
 python <skill_dir>/scripts/live_coach.py --spec <目标妆容spec> --interval 5

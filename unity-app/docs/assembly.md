@@ -21,18 +21,26 @@ Package Manager（Window → Package Manager → + → Add by git URL / by name�
 2. 其余全部留空 —— `Awake()` 自动创建：
    - `Main Camera`（固定在原点、朝 +Z、旋转恒等——世界空间即相机空间，勿移动）
    - `WebcamBackground` quad + `MakeupMirror/WebcamBackground` 材质 + `WebcamDisplay`
-   - `FaceMesh`（MeshFilter/MeshRenderer(禁用) + `FaceMeshDeformer`）
-   - `MakeupLayerRenderer`、`SplatLayerRenderer`、`CoachingDisplay`、UI Canvas（滑杆/进度条）、`BridgeClient`
+   - `AvatarRoot`（`GaussianAvatarRenderer` + `AvatarSplatRenderer`，3DGS 画像渲染）
+   - `AvatarStationFlow`（妆容台状态机：registered→preview→confirmed→station 布局切换）
+   - `CoachingDisplay`、UI Canvas（滑杆/进度条）、`BridgeClient`
+   - （legacy，默认不创建）`FaceMesh` + `MakeupLayerRenderer` + `SplatLayerRenderer`——
+     仅当 `MakeupAppMain.legacyFaceMakeup = true` 时装配（P1 真脸附妆链路）
 3. Player Settings：允许 `Windows Camera` 能力；分辨率 1280×720 起步。
-4. Build：Windows x86_64。产物运行前确认第 5 节 sidecar 在跑。
+4. Build：Windows x86_64。画像流程不需要 sidecar；legacy 真脸链路运行前确认第 5 节 sidecar 在跑。
 
 可调参数（可选）：
+- `MakeupAppMain.legacyFaceMakeup`：真脸附妆开关（**默认 false**——妆容只渲染在画像上）。
 - `MakeupAppMain.mirror`：镜像显示。通过**投影矩阵 x 翻转 + GL.invertCulling** 一处实现，
-  视频与 3D 妆容同步镜像（`WebcamDisplay.mirror` 保持 false，不要两边都开）。
-- `MakeupAppMain.backgroundDistance`：背景 quad 距离（需大于人脸距离，默认 2.5m）。
-- `FaceMeshDeformer.responsiveness`：1€ 滤波"稳定↔敏捷"（0 稳 / 1 跟手）。
-- `MakeupLayerRenderer.envStrength`：环境光合成强度（0 = 旧版无光照叠加）。
-- `SplatLayerRenderer.sizeScale / viewBlend`：溅射面片尺寸 / 侧向倾角混合。
+  视频与 3D 同步镜像（`WebcamDisplay.mirror` 保持 false，不要两边都开）。
+- `MakeupAppMain.backgroundDistance`：背景 quad 距离（需大于画像距离，默认 2.5m）。
+- `AvatarStationFlow.previewPosition / stationPosition / faceHeightMeters`：
+  画像预览（居中正对）与妆容台（右侧栏参照）布局、画像显示脸高（默认 0.22m）。
+- `GaussianAvatarRenderer.makeupIntensity / resortIntervalFrames`：妆容浓度（滑杆联动）/
+  视深排序节流（相机静止时每 6 帧重排一次）。
+- `AvatarSplatRenderer.sizeScale / viewBlend / intensity`：附加溅射尺寸/侧向倾角/浓度。
+- （legacy）`FaceMeshDeformer.responsiveness`、`MakeupLayerRenderer.envStrength`、
+  `SplatLayerRenderer.sizeScale / viewBlend`。
 
 ## 3. StreamingAssets（已随仓库附带）
 
@@ -76,15 +84,19 @@ sidecar 完全本地运行，不上传任何画面。
 坐标，见 `tools/tracking_protocol.py`；App 自动兼容 v1 JSON（`--legacy-json`，退回固定平面
 映射、无姿态对齐）。App→sidecar 帧中继为 `MKF1` 分片（≤16KB/片）。
 
-## 6. 溅射后端（内置排序实例化；UnityGaussianSplatting 可选）
+## 6. 溅射与画像渲染后端
 
-`SplatLayerRenderer` 内置后端：锚点 → 切平面朝向面片（长轴沿区域走向，外唇锚点向内唇内收），
-每帧按视深排序，`Graphics.RenderMeshInstanced` 批量绘制（≤1023/批），颜色走
-MaterialPropertyBlock 实例数组，强度/淡出/环境色温走 shader 全局量。无第三方依赖。
+**画像主渲染（P5，默认）**：`GaussianAvatarRenderer` 把注册画像的 PLY 解析为
+ComputeBuffer（位置/3D 协方差/颜色/tint），CPU 视深排序（相机动过阈值或每 6 帧重排）+
+`Graphics.DrawProceduralNow` 六顶点展开，`MakeupMirror/GaussianAvatarSplat` 在顶点着色器做
+标准 EWA 投影（Σworld→视空间→焦距雅可比→2D 协方差特征轴），premultiplied 混合。
+妆容 = `tint.bin`（per-Gaussian rgba，`avatar_session preview` 下发）×`_MakeupIntensity`
+插值，换妆不重建位置 buffer。附加溅射（唇釉/闪片）由 `AvatarSplatRenderer` 在画像局部空间
+实例化绘制（复用 `GaussianSplat` shader，queue 3150）。
 
-要换 aras-p/UnityGaussianSplatting：`splat_layers.json` 的锚点数据（position=关键点、
-sigma、offset、toward/inset、color、alpha）已是该库的 splat 语义，写一个运行时 converter
-填 `SplatGaussianAsset` 即可；渲染顺序在 mesh 层之后（queue 3100）已留好。
+**legacy 真脸溅射**：`SplatLayerRenderer`（锚点→切平面面片、外唇锚点内收、视深排序实例化）
+仅 `legacyFaceMakeup=true` 时装配。要换 aras-p/UnityGaussianSplatting：`splat_layers.json`
+锚点数据已是该库的 splat 语义，写一个 converter 填 `SplatGaussianAsset` 即可。
 
 ## 7. TTS（指导语音播报）
 

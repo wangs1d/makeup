@@ -22,10 +22,56 @@ def text(p: Path) -> str:
 
 
 def strip_comments_and_strings(src: str) -> str:
-    src = re.sub(r"//[^\n]*", "", src)
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
-    src = re.sub(r'"(\\.|[^"\\])*"', '""', src)
-    return src
+    """单遍扫描：字符串/字符字面量内的 // 与 /* 不是注释；注释内的引号也不是字符串。
+    （此前"先删注释后删字符串"会把 ws:// 这类字符串内容截断，留下悬空引号吞掉整个文件。）"""
+    out = []
+    i, n = 0, len(src)
+    state = "code"
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if c == '"':
+                state = "str"
+                out.append('"')
+            elif c == "'":
+                state = "char"
+                out.append("'")
+            elif c == "/" and nxt == "/":
+                state = "line"
+                i += 1
+            elif c == "/" and nxt == "*":
+                state = "block"
+                i += 1
+            else:
+                out.append(c)
+        elif state == "str":
+            if c == "\\":
+                i += 1                     # 跳过转义字符
+            elif c == '"':
+                state = "code"
+                out.append('"')
+            elif c == "\n":                # 未闭合字符串（异常源码）兜底
+                state = "code"
+                out.append("\n")
+        elif state == "char":
+            if c == "\\":
+                i += 1
+            elif c == "'":
+                state = "code"
+                out.append("'")
+        elif state == "line":
+            if c == "\n":
+                state = "code"
+                out.append("\n")
+        else:  # block
+            if c == "*" and nxt == "/":
+                state = "code"
+                i += 1
+            elif c == "\n":
+                out.append("\n")           # 保留换行，避免相邻 token 粘连
+        i += 1
+    return "".join(out)
 
 
 def test_files_present():
@@ -34,10 +80,13 @@ def test_files_present():
         "MakeupAppMain.cs", "BridgeClient.cs", "UdpLandmarkReceiver.cs", "FaceMeshDeformer.cs",
         "CanonicalFaceModel.cs", "RegionMaskBaker.cs", "MakeupLayerRenderer.cs",
         "SplatLayerRenderer.cs", "WebcamDisplay.cs", "CoachingDisplay.cs", "OneEuroFilter.cs",
+        # P5 画像妆容台
+        "GaussianAvatarParser.cs", "GaussianAvatarRenderer.cs",
+        "AvatarSplatRenderer.cs", "AvatarStationFlow.cs",
     }
     missing = expected - names
     assert not missing, f"缺少脚本：{missing}"
-    assert len(SH) == 3
+    assert len(SH) == 4, f"应含 4 个 shader（含 GaussianAvatarSplat）：{[p.name for p in SH]}"
 
 
 def test_braces_and_parens_balanced():
@@ -134,3 +183,54 @@ def test_face_tracker_modes():
 def test_webcam_background_keeps_simple():
     src = text(SHADERS / "WebcamBackground.shader")
     assert "_Mirror" in src
+
+
+# ---------------- P5 画像妆容台 ----------------
+
+def test_avatar_parser_and_renderer():
+    parser = text(SCRIPTS / "GaussianAvatarParser.cs")
+    # 标准 3DGS PLY（SH DC→sRGB、sigmoid、exp、quat 归一）与 MKMKP1 tint sidecar
+    for token in ("binary_little_endian", "f_dc_0", "opacity", "rot_0",
+                  "2.2f", "Mathf.Exp", "MKMK", "LoadTint", "LoadPly"):
+        assert token in parser, f"parser 缺少 {token}"
+    renderer = text(SCRIPTS / "GaussianAvatarRenderer.cs")
+    for token in ("ComputeBuffer", "ApplyTint",
+                  "Array.Sort(_depthKeys, _orderCpu)", "DrawProceduralNow",
+                  "_RootMatrix", "ClearTint", "resortIntervalFrames"):
+        assert token in renderer, f"renderer 缺少 {token}"
+    shader = text(SHADERS / "GaussianAvatarSplat.shader")
+    for token in ("StructuredBuffer<float4> _Tints", "StructuredBuffer<int>   _Order",
+                  "_MakeupIntensity", "_FocalPx", "Blend One OneMinusSrcAlpha",
+                  "premultiplied", "exp(-0.5"):
+        assert token in shader, f"avatar shader 缺少 {token}"
+
+
+def test_avatar_station_flow_state_machine():
+    flow = text(SCRIPTS / "AvatarStationFlow.cs")
+    # 状态机：idle → registered → preview → confirmed → station
+    for token in ("Registered", "Preview", "Confirmed", "Station", "StationState"):
+        assert token in flow, f"flow 缺少状态 {token}"
+    # Bridge v1.2 五类消息 + station_state 广播
+    for token in ("avatar_register", "avatar_preview", "avatar_confirm",
+                  "enter_station", "leave_station", "station_state"):
+        assert token in flow, f"flow 缺少消息 {token}"
+    # 妆容台布局：画像侧栏参照
+    assert "stationPosition" in flow and "previewPosition" in flow
+    splats = text(SCRIPTS / "AvatarSplatRenderer.cs")
+    assert "RenderMeshInstanced" in splats and "Array.Sort(_depthKeys, _order)" in splats
+    assert "add_splats.json" in splats or "splats" in splats
+
+
+def test_app_main_avatar_mode_default_no_face_makeup():
+    src = text(SCRIPTS / "MakeupAppMain.cs")
+    # 默认关闭真脸附妆（妆容只渲染在画像上）
+    assert "public bool legacyFaceMakeup = false;" in src
+    assert "legacyFaceMakeup" in src
+    # apply_spec 在画像模式下显式拒绝并指引 avatar_session
+    assert "avatar_mode_active" in src and "avatar_session" in src
+    # 画像/妆容台接线 + v1.2 消息分发
+    assert "avatarRenderer" in src and "avatarSplats" in src and "station.Handles" in src
+    # 既有能力保留（摄像头/指导/上报）
+    assert "PublishAmbientGlobals" in src
+    assert "assets_url" in src and "UnityWebRequest" in src
+    assert "CaptureJpegAsync" in src and "intensity_changed" in src

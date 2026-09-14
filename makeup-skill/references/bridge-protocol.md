@@ -1,12 +1,34 @@
-# Bridge WebSocket 协议（v1.1）
+# Bridge WebSocket 协议（v1.2）
 
 bridge_server 在 `ws://127.0.0.1:8765`（可改 `--port`）提供消息总线，两类客户端：
 
-- **agent**：本 skill 的脚本（apply_spec / live_coach / …）
+- **agent**：本 skill 的脚本（apply_spec / avatar_session / live_coach / …）
 - **app**：试妆 App（Unity 客户端，同协议可接任意客户端实现）
 
 消息均为单帧 JSON 文本。所有消息带 `type`；请求类消息带 `ref`（任意字符串），
 响应用 `{"type":"ack","ref":<原ref>,"status":"ok"|"error","error":"..."}` 回执。
+
+## v1.2 相对 v1.1 的变化（P5 画像妆容台）
+
+产品流程转向：**用户上传 3DGS 画像 → 选妆在画像上预览 → 确认 → 进妆容台辅助化妆**；
+妆容不再附着在摄像头真脸上（`apply_spec` 真脸链路降级为 App 端 legacy 开关，画像模式下
+App 会回 `ack error="avatar_mode_active..."` 指引改用 `avatar_session`）。
+
+1. **画像会话消息**（agent → app，均走既有 ref/ack 与定向路由，资产走 HTTP 侧车）：
+
+| type | 载荷要点 | 说明 |
+|---|---|---|
+| `avatar_register` | `{avatar_id, meta{count,raw_face_height_m,name,…}, assets_url{avatar.ply}}` | 注册画像；ply 为归一化后（居中 xy、脸高=1）的标准 3DGS 格式，App 下载建 GPU buffer 渲染 |
+| `avatar_preview` | `{avatar_id, look{name,intensity,regions,preview_info}, assets_url{tint.bin, add_splats.json}}` 或 `makeup{tint_bin_b64, add_splats}`（无侧车回退，≤32MB） | 选妆预览：tint 为每-Gaussian rgba（a=覆盖权重，浓度运行时乘），add_splats 为画像局部空间附加高斯 |
+| `avatar_confirm` | `{avatar_id}` | 用户确认妆效，App 锁定当前 look |
+| `enter_station` | `{avatar_id?, look{name,intensity}?}` | 进妆容台：画像移到侧栏作目标参照，摄像头画面保留（request_frame 照常），coaching/TTS 全开；真脸零渲染 |
+| `leave_station` | `{}` | 退出妆容台回到预览布局 |
+| `station_state` | `{state: registered\|preview\|confirmed\|station, avatar_id}`（app → agent 广播） | App 状态迁移回报 |
+
+2. **新 caps**（app hello 可声明）：`avatar`（可渲染 3DGS 画像）、`station`（支持妆容台布局）。
+3. **tint.bin 格式**（MKMKP1）：`magic "MKMK" + ver u16 + flags u16 + N u32 + rsv u32` + `N×rgba f32`；
+   行数必须与画像高斯数一致（两侧都按 register 时抽稀上限对齐，App 端不再抽稀）。
+4. 语义标注（MKSEM1 `semantics.bin`）只存在于 Python 编译侧，App 不消费。
 
 ## v1.1 相对 v1 的变化
 

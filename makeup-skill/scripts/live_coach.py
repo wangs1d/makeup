@@ -185,6 +185,20 @@ class Coach:
         if self.args.no_reference:
             return
         try:
+            # 画像妆容台流程：参考图来自画像编译产物（avatar_session preview 产出）
+            look_dir = getattr(self.args, "avatar_look", None)
+            if look_dir:
+                p = Path(look_dir) / "reference.jpg"
+                if not p.exists():
+                    raise FileNotFoundError(f"缺少画像编译参考图：{p}")
+                from avatar_render import imread
+                png = imread(p)                       # Unicode 安全读取
+                if png is None:
+                    raise IOError(f"参考图读取失败：{p}")
+                self.reference_b64 = base64.b64encode(
+                    cv2.imencode(".jpg", png, [cv2.IMWRITE_JPEG_QUALITY, 82])[1].tobytes()).decode()
+                print(f"[coach] 目标妆参考图（画像渲染）← {p}（随每轮发给 VLM 对比）")
+                return
             from preview_render import render_reference
             png = render_reference(self.spec, out_dir / "reference.jpg",
                                    size=512, env=self.args.env)
@@ -425,6 +439,15 @@ async def run(args: argparse.Namespace) -> None:
     if st.get("apps", 0) == 0:
         fail("没有试妆 App 连接：实时指导需要 App 回传摄像头画面（references/app-setup.md）")
     coach.make_reference(session_dir)
+    if args.station:
+        # 妆容台联动：让 App 切到 station 布局（画像侧栏参照，真脸不渲染妆容）
+        try:
+            await conn.request({"type": "enter_station", "look":
+                                {"name": spec.get("name", "look"),
+                                 "intensity": spec.get("intensity", 0.8)}}, timeout=10.0)
+            print("[coach] 已让 App 进入妆容台布局 ✓")
+        except Exception as e:  # noqa: BLE001
+            print(f"[coach] enter_station 失败（App 可能未加载画像，继续普通模式）：{e}")
 
     areas = " → ".join(AREA_CN.get(s["area"], s["area"]) for s in coach.steps)
     mode = "离线 canned" if args.test else f"VLM {vlm.VLM_MODEL}"
@@ -444,6 +467,11 @@ async def run(args: argparse.Namespace) -> None:
                 break
             await asyncio.sleep(args.interval)
     finally:
+        if args.station:
+            try:
+                await conn.send({"type": "leave_station"})
+            except Exception:  # noqa: BLE001
+                pass
         await conn.close()
         print(f"[coach] 已结束（共 {coach.rounds} 轮，推进到第 {coach.step_idx + 1} 步）")
 
@@ -460,6 +488,10 @@ def main() -> None:
     ap.add_argument("--steps", help="只陪练部分步骤，逗号分隔 area 名（base,eyebrow,eye,blush,lip）")
     ap.add_argument("--test", action="store_true", help="离线 canned 模式，不调 VLM（联调演示用）")
     ap.add_argument("--no-reference", action="store_true", help="不给 VLM 发目标妆参考图")
+    ap.add_argument("--avatar-look", default=None,
+                    help="画像编译目录（avatar_session preview 产出），参考图改用画像渲染效果")
+    ap.add_argument("--station", action="store_true",
+                    help="开始时让 App 进妆容台布局、结束时退出（画像试妆流程）")
     ap.add_argument("--env", default="neutral", help="参考图渲染环境光（neutral/warm/cool/dim）")
     ap.add_argument("--session-dir", default=None, help="参考图与会话报告目录（默认 out/coach-sessions/<时间戳>）")
     args = ap.parse_args()

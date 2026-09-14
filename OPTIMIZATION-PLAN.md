@@ -2,6 +2,11 @@
 
 > **实施进度（2026-09-11）**：P0–P4 已全部落地并通过测试（`pytest tests/` 59 项全过 + 端到端
 > Bridge 会话 + 重录 demo 视频）。长线项（FLAME/移动端）保持路线图。逐项状态见文中 ✅ 标注。
+>
+> **实施进度（2026-09-14）**：P5 画像妆容台落地——产品流程转向**上传 3DGS 画像 → 选妆画像
+> 预览 → 确认 → 妆容台辅助化妆**，真脸不再附着妆容（P1 链路降级 legacy 开关）。详见根目录
+> [AVATAR-PLAN.md](AVATAR-PLAN.md)。`pytest tests/` 84 项全过（含画像管线 10 项离线单测；
+> check_csharp.py 修复了字符串剥离 bug 并纳入默认收集，15 项断言现随套件运行）。
 
 > 基于 2026-09-10 对全仓代码的技术调研（Unity 10 个 C# 脚本、3 个 shader、skill 全部 Python 脚本、
 > preview 渲染管线、bridge 协议与文档），对照既定目标（README 路线图 + `.zcode/plans/` 原实施方案）
@@ -170,6 +175,36 @@ warn/urgency 高的提醒与步骤完成播报，info 不播；设置开关与�
 
 ---
 
+## P5 画像妆容台 ✅（2026-09-14 落地，方案与验收标准见 AVATAR-PLAN.md）
+
+架构转向：3DGS 画像承载妆容，替换"真脸 AR 附妆"为默认产品流。
+
+- **P5.1 画像 I/O 与语义** ✅ `avatar_io.py`（标准 3DGS PLY 解析/写出、SH DC→sRGB、
+  归一化脸高=1、MKMKP1/MKSEM1 二进制 sidecar）；`avatar_semantics.py`（per-Gaussian
+  region-ID：landmarks 自动（正脸渲染+MediaPipe 反投影）/manual 锚点/缓存三模式，
+  REGION_PROFILES 半径剖面与 UV 蒙版扩散量同源）
+- **P5.2 妆容编译器** ✅ `makeup_compiler.py`：spec layers → 每高斯 tint（alpha-over 混色、
+  向心度取 ramp、颗粒）+ 附加溅射（表面 PCA 法线、切向长轴、≤1200/层）；`--only` 单品语义
+  （未选 region 清零），换色号秒级重编译
+- **P5.3 软件光栅预览** ✅ `avatar_render.py`：逐高斯 EWA（屏幕 2D 协方差解析特征轴）、
+  深度排序 alpha 混合、环境色温与 preview_render 同预设；preview.jpg（裸妆|妆后）/
+  reference.jpg/转台
+- **P5.4 Bridge v1.2 + 会话** ✅ `avatar_session.py`（register/preview/confirm/station/
+  leave/status；资产 HTTP 侧车；语义与编译缓存 out/avatars/）；`live_coach.py --station
+  --avatar-look`（妆容台联动 + 画像渲染参考图）；协议文档 v1.2
+- **P5.5 Unity 画像渲染与妆容台** ✅ `GaussianAvatarParser.cs`（PLY/tint 解析，零依赖）、
+  `GaussianAvatarRenderer.cs`（ComputeBuffer + CPU 视深排序节流 + DrawProceduralNow）、
+  `GaussianAvatarSplat.shader`（EWA 顶点投影、premultiplied、tint×浓度混妆）、
+  `AvatarSplatRenderer.cs`（静态附加溅射）、`AvatarStationFlow.cs`（五态状态机 +
+  station_state 广播）；`MakeupAppMain` 默认 `legacyFaceMakeup=false`——真脸附妆停用，
+  apply_spec 在画像模式回明确指引
+- **验收** ✅ 见 AVATAR-PLAN.md 第四节：离线单测（synthetic 画像 + manual 锚点，不依赖
+  mediapipe）、check_csharp 新增画像管线断言、文档五处同步
+- **遗留到 P6**：画像表情驱动（FLAME 系数 rig → Gaussian 蒙皮）；GPU bitonic 排序
+  （>30 万点时）；移动端移植
+
+---
+
 ## 长线（保持 README 路线图，依赖 P1/P2 铺垫）
 
 - **FLAME 3DMM 拟合**：P1 完成姿态/表情解耦后，把表情层从 468 点直驱升级为 FLAME
@@ -178,7 +213,7 @@ warn/urgency 高的提醒与步骤完成播报，info 不播；设置开关与�
 - **移动端**：ARKit `ARFaceAnchor` 直接给 blendshapes + UV 布局，RegionMaskBaker
   逻辑可整体复用；sidecar 换原生追踪（P4 的二进制协议即为此设计）。
 - **自然语言改妆**：agent 直接改 spec 单层下发（`--only lipstick` + 色号替换），
-  "口红换番茄色"一句话完成——skill 侧已具备，补一条 SKILL.md 工作流示例即可。
+  "口红换番茄色"一句话完成——skill 侧已具备，SKILL.md 已补「自然语言改妆」工作流示例（✅ 2026-09-14）。
 
 ## 实施顺序建议
 

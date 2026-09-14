@@ -1,12 +1,15 @@
 // MakeupAppMain.cs
-// App 主入口：程序化搭建场景（背景 quad / 人脸 mesh / UI），接线 Bridge ↔ 渲染 ↔ 指导显示。
+// App 主入口：程序化搭建场景（背景 quad / 画像 / UI），接线 Bridge ↔ 渲染 ↔ 指导显示。
 //
-// 真·AR 对齐（P1）：Unity 相机固定在原点、朝 +Z、旋转恒等 —— 世界空间 = 相机空间。
-//   · 相机 FOV 由追踪包的 focal_px/h 推出，与 sidecar 的投影模型一致，人脸网格投影落在视频人脸上；
-//   · 背景 quad 按同一 FOV 与摄像头宽高比铺满视锥；
-//   · 镜像用投影矩阵 x 翻转 + GL.invertCulling 一处实现（视频与 3D 同步镜像）。
-// 处理 apply_spec（assets 内嵌 base64 或 assets_url HTTP 下载）、clear_makeup、set_intensity、
-// coaching（含 progress/step）、request_frame（异步）、ping；上报实测 tracking_state、intensity_changed。
+// 画像妆容台（P5，默认流程）：用户上传 3DGS 画像 → 选妆画像预览 → 确认 → 进妆容台辅助化妆。
+//   · 画像渲染 GaussianAvatarRenderer + 附加溅射 AvatarSplatRenderer，布局由 AvatarStationFlow 驱动；
+//   · 妆容只渲染在画像上，摄像头里的真脸零附着（真脸附妆链路降级为 legacyFaceMakeup 开关）；
+//   · 摄像头画面保留（request_frame 给 VLM 指导用），tracking sidecar 变为可选。
+// Legacy（legacyFaceMakeup=true）：P1 真脸 AR 贴妆链路（FaceMeshDeformer/MakeupLayerRenderer/
+// SplatLayerRenderer），依赖 sidecar MKT2 追踪与 FOV 对齐。
+// 处理 apply_spec（legacy）/avatar_register/avatar_preview/avatar_confirm/enter_station/
+// leave_station/coaching（含 progress/step）/request_frame（异步）/ping；
+// 上报实测 tracking_state、intensity_changed、station_state（经 AvatarStationFlow）。
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -23,15 +26,22 @@ namespace MakeupMirror
         [Header("可选：场景里已搭好的组件（留空则程序化创建）")]
         public WebcamDisplay webcam;
         public UdpLandmarkReceiver tracker;
-        public FaceMeshDeformer deformer;
-        public MakeupLayerRenderer makeup;
-        public SplatLayerRenderer splat;
         public BridgeClient bridge;
         public CoachingDisplay coaching;
         public Canvas uiCanvas;
+        [Header("画像妆容台（默认流程）")]
+        public GaussianAvatarRenderer avatarRenderer;
+        public AvatarSplatRenderer avatarSplats;
+        public AvatarStationFlow station;
+        [Header("Legacy：真脸 AR 附妆（默认关闭——妆容只画在画像上）")]
+        [Tooltip("开启后恢复 P1 真脸贴妆链路（需要 tracking sidecar）")]
+        public bool legacyFaceMakeup = false;
+        public FaceMeshDeformer deformer;
+        public MakeupLayerRenderer makeup;
+        public SplatLayerRenderer splat;
 
         [Header("显示")]
-        [Tooltip("镜像显示（照镜子习惯）：投影矩阵翻转，视频与妆容一起镜像")]
+        [Tooltip("镜像显示（照镜子习惯）：投影矩阵翻转，视频与 3D 同步镜像")]
         public bool mirror = true;
         [Tooltip("背景 quad 距离（米），需大于人脸距离")]
         public float backgroundDistance = 2.5f;
@@ -89,27 +99,52 @@ namespace MakeupMirror
             _bgQuad = webcam.transform;
 
             if (tracker == null) tracker = gameObject.AddComponent<UdpLandmarkReceiver>();
-            if (deformer == null)
+
+            // 画像妆容台链路（默认流程）：妆容渲染在 3DGS 画像上
+            if (avatarRenderer == null)
             {
-                var faceGo = new GameObject("FaceMesh");
-                faceGo.transform.SetParent(transform, false);
-                deformer = faceGo.AddComponent<FaceMeshDeformer>();
-                deformer.tracker = tracker;
-                deformer.meshFilter = faceGo.AddComponent<MeshFilter>();
-                var faceMr = faceGo.AddComponent<MeshRenderer>();
-                faceMr.enabled = false;   // 底网格不画：妆容层共享它的 mesh，各自带材质
+                var avatarGo = new GameObject("AvatarRoot");
+                avatarGo.transform.SetParent(transform, false);
+                avatarRenderer = avatarGo.AddComponent<GaussianAvatarRenderer>();
+                avatarRenderer.viewCamera = _cam;
+                avatarSplats = avatarGo.AddComponent<AvatarSplatRenderer>();
+                avatarSplats.splatShader = Shader.Find("MakeupMirror/GaussianSplat");
             }
-            if (makeup == null)
+            if (avatarSplats == null)
+                avatarSplats = avatarRenderer.gameObject.AddComponent<AvatarSplatRenderer>();
+            if (station == null)
             {
-                makeup = gameObject.AddComponent<MakeupLayerRenderer>();
-                makeup.deformer = deformer;
+                station = gameObject.AddComponent<AvatarStationFlow>();
+                station.avatarRenderer = avatarRenderer;
+                station.avatarSplats = avatarSplats;
             }
-            if (splat == null)
+
+            // Legacy 真脸附妆链路：默认关闭（妆容台不再往真脸上画妆）
+            if (legacyFaceMakeup)
             {
-                splat = gameObject.AddComponent<SplatLayerRenderer>();
-                splat.deformer = deformer;
-                splat.viewCamera = _cam;
+                if (deformer == null)
+                {
+                    var faceGo = new GameObject("FaceMesh");
+                    faceGo.transform.SetParent(transform, false);
+                    deformer = faceGo.AddComponent<FaceMeshDeformer>();
+                    deformer.tracker = tracker;
+                    deformer.meshFilter = faceGo.AddComponent<MeshFilter>();
+                    var faceMr = faceGo.AddComponent<MeshRenderer>();
+                    faceMr.enabled = false;   // 底网格不画：妆容层共享它的 mesh，各自带材质
+                }
+                if (makeup == null)
+                {
+                    makeup = gameObject.AddComponent<MakeupLayerRenderer>();
+                    makeup.deformer = deformer;
+                }
+                if (splat == null)
+                {
+                    splat = gameObject.AddComponent<SplatLayerRenderer>();
+                    splat.deformer = deformer;
+                    splat.viewCamera = _cam;
+                }
             }
+
             if (coaching == null) coaching = gameObject.AddComponent<CoachingDisplay>();
             if (uiCanvas == null) uiCanvas = BuildUI();
             if (bridge == null) bridge = gameObject.AddComponent<BridgeClient>();
@@ -252,8 +287,9 @@ namespace MakeupMirror
         private void OnSliderChanged(float v)
         {
             if (_intensityLabel != null) _intensityLabel.text = $"妆感 {Mathf.RoundToInt(v * 100)}%";
-            if (_sliderSilent) return;
-            makeup.SetIntensity(v);
+            avatarRenderer.makeupIntensity = v;          // 画像链路（默认）
+            if (makeup != null) makeup.SetIntensity(v);  // legacy 真脸链路
+            if (_sliderSilent) return;                   // 程序化同步不回传
             _pendingIntensity = v;   // 节流上报（Update 里发）
         }
 
@@ -292,7 +328,7 @@ namespace MakeupMirror
 
         private void Update()
         {
-            // FOV / 背景与追踪包几何联动（focal 或分辨率变化时刷新一次）
+            // Legacy：FOV / 背景与追踪包几何联动（focal 或分辨率变化时刷新一次）
             if (tracker.TryGetLatest(out var frame) && frame.faceOk && !frame.legacy && frame.focalPx > 1f
                 && (Mathf.Abs(frame.focalPx - _appliedFocal) > 0.5f || frame.width != _appliedW || frame.height != _appliedH))
             {
@@ -309,19 +345,26 @@ namespace MakeupMirror
                 string pose = frame.hasPose ? "pose ✓" : (frame.legacy ? "legacy" : "no-pose");
                 _statusText.text = $"bridge: {_statusBridge}   tracking: {_statusTracking} · {tracker.MeasuredFps:F0} fps · "
                                    + $"{tracker.LastLandmarkCount} pts · {pose}"
-                                   + (makeup.CurrentSpecName != null ? $"   妆容: {makeup.CurrentSpecName}" : "")
-                                   + (splat.Count > 0 ? $" · splat {splat.Count}" : "");
+                                   + (station != null && station.State != AvatarStationFlow.StationState.Idle
+                                       ? $"   画像: {station.AvatarId ?? "-"} [{station.State}]" : "")
+                                   + (makeup != null && makeup.CurrentSpecName != null ? $"   妆容: {makeup.CurrentSpecName}" : "")
+                                   + (splat != null && splat.Count > 0 ? $" · splat {splat.Count}" : "")
+                                   + (avatarRenderer != null && avatarRenderer.IsLoaded
+                                       ? $" · avatar {avatarRenderer.Count}" : "");
             }
 
             if (!bridge.Connected) return;
-            // tracking_state 节流上报（实测 fps / 点数）
+            // tracking_state 节流上报（实测 fps / 点数；画像妆容台模式无 sidecar 时 ok 恒真，
+            // 避免指导端误报"脸没对准"——真脸追踪仅在 legacy 链路有意义）
             if (Time.time - _lastTrackingPush > 1f)
             {
                 _lastTrackingPush = Time.time;
+                bool faceOk = deformer != null ? deformer.HasFace
+                    : (frame.faceOk || tracker.MeasuredFps <= 0f);
                 _ = bridge.SendJson(new JObject
                 {
                     ["type"] = "tracking_state",
-                    ["ok"] = deformer.HasFace,
+                    ["ok"] = faceOk,
                     ["fps"] = Mathf.Round(tracker.MeasuredFps * 10f) / 10f,
                     ["landmarks"] = tracker.LastLandmarkCount,
                     ["pose"] = frame.hasPose,
@@ -367,22 +410,41 @@ namespace MakeupMirror
             string reference = msg.Value<string>("ref");
             try
             {
+                // 画像妆容台会话（Bridge v1.2）：register/preview/confirm/enter/leave station
+                if (station != null && station.Handles(type))
+                {
+                    await station.HandleAsync(msg, reference);
+                    return;
+                }
                 switch (type)
                 {
                     case "apply_spec":
+                        if (!legacyFaceMakeup)
+                        {
+                            // 妆容台流程：真脸不再附着妆容，改走 avatar_session
+                            await bridge.SendAck(reference, false,
+                                "avatar_mode_active: 请使用 avatar_session（register/preview/station），真脸附妆已停用");
+                            break;
+                        }
                         await ApplySpec(msg);
                         await bridge.SendAck(reference, true);
                         break;
                     case "clear_makeup":
-                        makeup.Clear();
-                        splat.Clear();
+                        if (legacyFaceMakeup && makeup != null)
+                        {
+                            makeup.Clear();
+                            splat.Clear();
+                        }
+                        if (station != null) station.ClearLook();
                         coaching.SetProgress(null, 0, 0, 0f);
                         await bridge.SendAck(reference, true);
                         break;
                     case "set_intensity":
                     {
                         float v = msg.Value<float?>("value") ?? 0.8f;
-                        makeup.SetIntensity(v);
+                        avatarRenderer.makeupIntensity = v;
+                        if (makeup != null) makeup.SetIntensity(v);
+                        avatarSplats.intensity = v;
                         SetSliderSilently(v);
                         await bridge.SendAck(reference, true);
                         break;
