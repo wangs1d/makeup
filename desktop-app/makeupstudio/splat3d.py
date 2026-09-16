@@ -72,9 +72,10 @@ class SplatCloudBuilder:
     """由妆容 layers 生成稠密 3DGS 点云。env 与内核 ENVS 同名预设。"""
 
     def __init__(self, obj_path: str | Path | None = None,
-                 regions_json: str | Path | None = None, env: str = "neutral"):
+                 regions_json: str | Path | None = None, env: str = "neutral",
+                 tex: int | None = None):
         self.core = _load_core()
-        self.renderer = self.core.get_renderer(640, 538)
+        self.renderer = self.core.get_renderer(640, 538, tex=tex)
         self.renderer.set_env(env)
         self.env = env
 
@@ -85,7 +86,16 @@ class SplatCloudBuilder:
     # ---------------- 主入口 ----------------
 
     def build(self, layers: list[dict], intensity: float = 1.0,
-              n_base: int = 45000, n_makeup: int = 30000, seed: int = 7) -> dict:
+              n_base: int = 45000, n_makeup: int = 30000, seed: int = 7,
+              n_detail2: int | None = None) -> dict:
+        """生成稠密 3DGS 点云。
+
+        高光采用"延迟"策略：构建时只烘漫反射色 + 逐点 sheen 值（cloud["sheen"]），
+        Blinn-Phong 清漆项留给 render_splats_python 按真实视角计算——任意偏航角下
+        唇釉/珠光的高光都随视角流动，而不是静态烙死在构建视角上。
+        n_detail2：第二档超细采样数（默认 n_makeup//2），按 alpha² 加权集中于
+        唇线/眼线/眉等高频区，σ 再缩一档，锐度直接决定"像不像真妆"。
+        """
         core = self.core
         rng = np.random.default_rng(seed)
         model = self.renderer.model
@@ -101,7 +111,12 @@ class SplatCloudBuilder:
         layers = splat_layers
         V = model.pose_explicit(0.0, -2.0, 0.0, 0.03, 0.12)
         N = model.vertex_normals(V)
-        rgba, sheen = self.renderer.makeup_for("splat:" + str(len(layers)), layers)
+        # 缓存 key 必须含层内容：同层数不同 spec（如"全禁用"的素颜）会撞 key，
+        # 拿到上一次的零纹理 → 妆容整体消失（历史 bug）
+        import zlib as _zlib
+        rgba, sheen = self.renderer.makeup_for(
+            "splat:" + str(_zlib.crc32(json.dumps(layers, sort_keys=True).encode())),
+            layers)
         skin, edge = self.renderer.skin, self.renderer.edge
         tint = self.renderer.tint
         L, view = self.renderer.L, self.renderer.view_dir
@@ -142,7 +157,8 @@ class SplatCloudBuilder:
         alpha = np.full(len(P), 0.95, np.float32)
         sig_base = base_sigma * (0.45 + 0.55 * np.clip(edge_a, 0, 1))
         parts = []
-        parts.append(self._assemble(P, Nn, sig_base, col, alpha))
+        parts.append(self._assemble(P, Nn, sig_base, col, alpha,
+                                    np.zeros(len(P), np.float32)))
 
         # ---- 妆容细节层（alpha 加权加密采样，σ 更小保锐度；沿法线抬升避免与皮肤层 z-fighting）----
         va = core._bilinear(rgba[..., 3], model.uvs[:, 0] * (core.TEX - 1),
@@ -159,12 +175,32 @@ class SplatCloudBuilder:
             mk = core._bilinear(rgba, tx, ty)
             sh_m = core._bilinear(sheen, tx, ty)[..., 0]
             edge_m = core._bilinear(edge, tx, ty)[..., 0]
-            col_m = self._shade_surface(skin_m, mk, sh_m, edge_m, Nm, L, view, tint,
-                                        intensity, is_makeup=True, sheen_map=sh_m)
+            col_m, sh_pts = self._shade_surface(skin_m, mk, sh_m, edge_m, Nm, L, view, tint,
+                                                intensity, is_makeup=True, sheen_map=sh_m,
+                                                defer_spec=True)
             # col_m 已是"皮肤×妆容"合成后的最终色 → 近不透明绘制，避免半透明斑点
             a_m = np.full(len(Pm), 0.92, np.float32)
             parts.append(self._assemble(Pm, Nm, np.full(len(Pm), base_sigma * 0.5),
-                                        col_m, a_m))
+                                        col_m, a_m, sh_pts))
+
+        # ---- 超细细节层（alpha² 加权 → 集中在唇线/眼线/眉等高频区，σ 再缩一档）----
+        cnt2 = n_makeup // 2 if n_detail2 is None else int(n_detail2)
+        sel2 = tri_a > 0.35
+        if sel2.any() and cnt2 > 0:
+            P2_, N2_, uv2, _ = sample_points(np.nonzero(sel2)[0],
+                                             area[sel2] * tri_a[sel2] ** 2, cnt2)
+            P2_ = P2_ + N2_ * (base_sigma * 0.5)
+            tx2, ty2 = uv2[:, 0] * (core.TEX - 1), (1 - uv2[:, 1]) * (core.TEX - 1)
+            mk2 = core._bilinear(rgba, tx2, ty2)
+            skin2 = core._bilinear(skin, tx2, ty2)
+            sh2 = core._bilinear(sheen, tx2, ty2)[..., 0]
+            edge2 = core._bilinear(edge, tx2, ty2)[..., 0]
+            col2, sh_pts2 = self._shade_surface(skin2, mk2, sh2, edge2, N2_, L, view, tint,
+                                                intensity, is_makeup=True, sheen_map=sh2,
+                                                defer_spec=True)
+            a_2 = np.full(len(P2_), 0.9, np.float32)
+            parts.append(self._assemble(P2_, N2_, np.full(len(P2_), base_sigma * 0.3),
+                                        col2, a_2, sh_pts2))
 
         # 眼部/口腔暗部已包含在烘焙肤色纹理中（lips_inner / eyelid 底色），
         # 不再单独放暗盘 splat —— 单盘大 σ 会形成污渍状伪影。
@@ -196,17 +232,23 @@ class SplatCloudBuilder:
                     "scale": np.array([[sig, sig, sig * 0.35]], np.float32),
                     "rot": rot_a,
                     "rgba": np.concatenate([col_a, [alpha_a]])[None, :],
+                    "sheen": np.zeros(1, np.float32),
                 })
 
         cloud = {}
-        for k in ("xyz", "scale", "rot", "rgba"):
+        for k in ("xyz", "scale", "rot", "rgba", "sheen"):
             cloud[k] = np.concatenate([p[k] for p in parts], axis=0).astype(np.float32)
         return cloud
 
     # ---------------- 着色（复刻内核 _raster 的皮肤+妆容光照） ----------------
 
     def _shade_surface(self, skin, mk, sh_map, edge_a, Nn, L, view, tint,
-                       intensity, is_makeup, sheen_map=None):
+                       intensity, is_makeup, sheen_map=None, defer_spec=False):
+        """复刻内核 _raster 的皮肤+妆容光照。
+
+        defer_spec=True 时不把 sheen/清漆高光烘进颜色，改为返回逐点 sheen 值
+        （col, sh_pts），由 render_splats_python 按真实视角补 Blinn-Phong——
+        构建视角之外的高光才能正确随视角流动。"""
         ndl = np.clip(Nn @ L, -1, 1)
         ndv = np.clip(Nn @ view, 0, 1)
         ndh_vec = L + view
@@ -226,23 +268,28 @@ class SplatCloudBuilder:
             mndl = np.clip((ndl + mwrap) / (1 + mwrap), 0, 1)
             mdiff = 0.55 + 0.45 * mndl
             mcol = mk[..., :3] * tint * mdiff[..., None]
-            fres = (1.0 - ndv) ** 3
-            sheen = fres * sheen_map * (0.15 + sheen_map * 0.5)
-            finish_gloss = np.clip(sheen_map - 0.5, 0, 1) * 2.0
-            spec = (ndh ** (60 + 60 * sheen_map)) * finish_gloss * 0.5
-            mcol += (sheen + spec)[..., None] * tint
+            if not defer_spec:
+                fres = (1.0 - ndv) ** 3
+                sheen = fres * sheen_map * (0.15 + sheen_map * 0.5)
+                finish_gloss = np.clip(sheen_map - 0.5, 0, 1) * 2.0
+                spec = (ndh ** (60 + 60 * sheen_map)) * finish_gloss * 0.5
+                mcol += (sheen + spec)[..., None] * tint
             a = np.clip(mk[..., 3] * intensity * edge_a, 0, 1)
             col = col * (1 - a[..., None]) + mcol * a[..., None]
+            if defer_spec:
+                return np.clip(col, 0, 1), np.clip(sheen_map, 0, 1).astype(np.float32)
         return np.clip(col, 0, 1)
 
-    def _assemble(self, P, Nn, sigma2d, col, alpha):
+    def _assemble(self, P, Nn, sigma2d, col, alpha, sheen=None):
         """薄片高斯：σxy 沿切平面、σz 压扁；旋转 = 法线对齐四元数。"""
         n = len(P)
         keep = alpha > 0.004
         P, Nn, sigma2d, col, alpha = P[keep], Nn[keep], sigma2d[keep], col[keep], alpha[keep]
+        sh = sheen[keep] if sheen is not None else np.zeros(len(P), np.float32)
         if len(P) == 0:
             return {"xyz": np.zeros((0, 3)), "scale": np.zeros((0, 3)),
-                    "rot": np.zeros((0, 4)), "rgba": np.zeros((0, 4))}
+                    "rot": np.zeros((0, 4)), "rgba": np.zeros((0, 4)),
+                    "sheen": np.zeros((0,), np.float32)}
         # 切平面基
         up = np.array([0.0, 1.0, 0.0])
         alt = np.array([1.0, 0.0, 0.0])
@@ -253,7 +300,7 @@ class SplatCloudBuilder:
         rot = np.stack([_quat_from_frame(t1[i], t2[i], Nn[i]) for i in range(len(P))])
         scale = np.stack([sigma2d, sigma2d, sigma2d * 0.35], axis=1)
         rgba = np.concatenate([col, alpha[:, None]], axis=1)
-        return {"xyz": P, "scale": scale, "rot": rot, "rgba": rgba}
+        return {"xyz": P, "scale": scale, "rot": rot, "rgba": rgba, "sheen": sh}
 
     def _cavity_splats(self, V, N, model, regions, base_sigma):
         pts, cols, sig = [], [], []
@@ -336,9 +383,41 @@ class SplatCloudBuilder:
 
 # ---------------- 还原度：CPU 前向泼溅渲染 + PSNR ----------------
 
+def _view_dependent_spec(cloud: dict, R: np.ndarray) -> np.ndarray:
+    """延迟高光：按真实视角（旋转后的法线 + 固定视线 (0,0,1) + 中性光源）逐点计算
+    sheen fresnel + Blinn-Phong 清漆。cloud 无 sheen 键（用户点云）时返回 0。"""
+    n = len(cloud["xyz"])
+    sh = cloud.get("sheen")
+    if sh is None or float(np.max(np.asarray(sh), initial=0.0)) < 1e-4:
+        return np.zeros((n, 1), np.float32)
+    sh = np.asarray(sh, np.float64)
+    # 法线 = 四元数旋转 (0,0,1)，再随相机旋转 R
+    rot = np.asarray(cloud["rot"], np.float64)
+    qn = np.stack([2 * (rot[:, 0] * rot[:, 2] + rot[:, 1] * rot[:, 3]),
+                   2 * (rot[:, 1] * rot[:, 2] - rot[:, 0] * rot[:, 3]),
+                   1 - 2 * (rot[:, 0] ** 2 + rot[:, 1] ** 2)], axis=1)
+    qn /= np.linalg.norm(qn, axis=1, keepdims=True) + 1e-12
+    N = qn @ R.T
+    view = np.array([0.0, 0.0, 1.0])
+    L = np.array([0.15, 0.45, 0.85])
+    L /= np.linalg.norm(L)
+    H = L + view
+    H /= np.linalg.norm(H)
+    ndv = np.clip(N @ view, 0, 1)
+    ndh = np.clip(N @ H, 0, 1)
+    fres = (1.0 - ndv) ** 3
+    sheen = fres * sh * (0.15 + sh * 0.5)
+    finish_gloss = np.clip(sh - 0.5, 0, 1) * 2.0
+    spec = (ndh ** (60 + 60 * sh)) * finish_gloss * 0.5
+    return (sheen + spec)[..., None].astype(np.float32)
+
+
 def render_splats_python(cloud: dict, w: int = 640, h: int = 538, yaw_deg: float = 0.0,
                          max_splats: int = 60000) -> np.ndarray:
-    """与 render_still 相同相机参数（f=h*1.85, d=2.3）的前向泼溅。返回 BGR uint8。"""
+    """与 render_still 相同相机参数（f=h*1.85, d=2.3）的前向泼溅。返回 BGR uint8。
+
+    高光为延迟计算（_view_dependent_spec）：任意偏航角下唇釉/珠光随视角流动，
+    与构建视角解耦。"""
     core = _load_core()
     model = core.get_renderer(w, h).model
     V = model.pose_explicit(yaw_deg, -2.0, 0.0, 0.03, 0.12)
@@ -350,6 +429,7 @@ def render_splats_python(cloud: dict, w: int = 640, h: int = 538, yaw_deg: float
     xyz = cloud["xyz"] @ R.T
     scale = cloud["scale"]
     rgba = cloud["rgba"]
+    spec = _view_dependent_spec(cloud, R)
     f = h * 1.85
     d = 2.3
     depth = d - xyz[:, 2]
@@ -377,7 +457,7 @@ def render_splats_python(cloud: dict, w: int = 640, h: int = 538, yaw_deg: float
         rows, cols = np.mgrid[max(0, y0):min(h, y1 + 1), max(0, x0):min(w, x1 + 1)]
         g = np.exp(-0.5 * (((cols - cx) / sig_px) ** 2 + ((rows - cyy) / sig_px) ** 2)) * a
         sl = canvas[max(0, y0):min(h, y1 + 1), max(0, x0):min(w, x1 + 1)]
-        sl[:] = sl * (1 - g[..., None]) + rgba[i, :3] * g[..., None]
+        sl[:] = sl * (1 - g[..., None]) + (rgba[i, :3] + spec[i]) * g[..., None]
     return np.clip(canvas * 255, 0, 255).astype(np.uint8)[..., ::-1]
 
 

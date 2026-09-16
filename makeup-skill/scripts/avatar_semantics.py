@@ -34,29 +34,30 @@ REGION_IDS = {"none": 0, "foundation": 1, "concealer": 2, "contour": 3, "eyebrow
               "eyeshadow": 5, "eyeliner": 6, "blush": 7, "highlight": 8, "lipstick": 9}
 ID_REGIONS = {v: k for k, v in REGION_IDS.items()}
 
-# region → (基准组, 半径剖面)。半径单位=脸高；spread 是各锚点的附加偏移（法向/切向扩面）。
-# 与 RegionMaskBaker/RegionMasks 的 UV 扩散量同源（见 FEATHER_PX 与 shape 默认值）。
+# region → (基准组, 半径剖面)。半径单位=脸高；offset 是各锚点的法向附加外扩。
+# z_min：认领高斯的 z 下限（归一化空间脸朝 +Z）——防止大半径 region（粉底/腮红）
+# 越过脸侧轮廓染到头发/耳侧高斯（渲染上表现为轮廓亮圈）。
 REGION_PROFILES: dict[str, dict] = {
     "foundation": {"groups": ["foundation_face_oval", "cheekbone_left", "cheekbone_right"],
-                   "radius": 0.30, "offset": 0.0},
+                   "radius": 0.30, "offset": 0.0, "z_min": 0.10},
     "concealer":  {"groups": ["lower_lid_left", "lower_lid_right"],
-                   "radius": 0.075, "offset": -0.008},
+                   "radius": 0.075, "offset": -0.008, "z_min": 0.02},
     "contour":    {"groups": ["contour_forehead", "contour_jaw_left", "contour_jaw_right",
                               "contour_nose"],
-                   "radius": 0.085, "offset": 0.0},
+                   "radius": 0.085, "offset": 0.0, "z_min": 0.04},
     "eyebrow":    {"groups": ["eyebrow_left", "eyebrow_right"],
-                   "radius": 0.045, "offset": 0.0},
+                   "radius": 0.045, "offset": 0.0, "z_min": 0.02},
     "eyeshadow":  {"groups": ["eyelid_left", "eyelid_right"],
-                   "radius": 0.062, "offset": 0.006},
+                   "radius": 0.075, "offset": 0.006, "z_min": 0.02},
     "eyeliner":   {"groups": ["eyeliner_left", "eyeliner_right"],
-                   "radius": 0.022, "offset": 0.002},
+                   "radius": 0.022, "offset": 0.002, "z_min": 0.02},
     "blush":      {"groups": ["blush_left", "blush_right", "cheekbone_left", "cheekbone_right"],
-                   "radius": 0.16, "offset": 0.004},
+                   "radius": 0.16, "offset": 0.004, "z_min": 0.10},
     "highlight":  {"groups": ["highlight_cheek_left", "highlight_cheek_right",
                               "highlight_nose", "highlight_cupid"],
-                   "radius": 0.055, "offset": 0.003},
+                   "radius": 0.045, "offset": 0.003, "z_min": 0.05},
     "lipstick":   {"groups": ["lips_outer", "lips_inner"],
-                   "radius": 0.052, "offset": 0.002},
+                   "radius": 0.045, "offset": 0.002, "z_min": 0.02},
 }
 
 
@@ -170,7 +171,12 @@ class SurfaceProbe:
 # ---------------- 主入口 ----------------
 
 def assign_regions(av, anchors: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """按相对距离给每个 Gaussian 分配 region。返回 (ids (N,) u8, conf (N,) f32)。"""
+    """按相对距离给每个 Gaussian 分配 region。返回 (ids (N,) u8, conf (N,) f32)。
+
+    关键：小半径 region（唇/眼线等，语义更具体）优先认领并冻结——否则大半径
+    region（粉底 0.30）会按相对距离抢走小 region 的边缘高斯，导致唇色只上在
+    中心一小块。认领阈值 1.0，冻结阈值 0.95。
+    """
     n = av.n
     ids = np.zeros(n, np.uint8)
     conf = np.zeros(n, np.float32)
@@ -183,22 +189,55 @@ def assign_regions(av, anchors: dict[str, np.ndarray]) -> tuple[np.ndarray, np.n
     cand = np.nonzero(np.all((means >= lo) & (means <= hi), axis=1))[0]
     if len(cand) == 0:
         return ids, conf
-    sub = means[cand]
 
-    for region, pts in anchors.items():
+    def radius_of(region: str) -> float:
         prof = REGION_PROFILES[region]
-        radius = float(prof["radius"]) + float(prof.get("offset", 0.0))
+        return float(prof["radius"]) + float(prof.get("offset", 0.0))
+
+    free = np.ones(len(cand), bool)
+    order = sorted(anchors, key=radius_of)                       # 小半径优先
+
+    # 脸型椭圆约束：foundation 锚点环绕脸部一周 → 拟合外接椭圆（+6% 余量），
+    # 大半径 region（粉底/腮红/轮廓）只认领椭圆内的高斯——否则会把发际线外、
+    # 鬓角/头顶的头发染上底妆（渲染为轮廓亮圈）。小 region 锚点本身贴特征，无需约束。
+    oval = None
+    if "foundation" in anchors:
+        fp = anchors["foundation"]
+        cx, cy = (fp[:, 0].min() + fp[:, 0].max()) / 2, (fp[:, 1].min() + fp[:, 1].max()) / 2
+        rx = max((fp[:, 0].max() - fp[:, 0].min()) / 2, 0.12) * 1.06
+        ry = max((fp[:, 1].max() - fp[:, 1].min()) / 2, 0.12) * 1.06
+        oval = (cx, cy, rx, ry)
+
+    for region in order:
+        prof = REGION_PROFILES[region]
+        pts = anchors[region]
+        radius = radius_of(region)
+        z_min = float(prof.get("z_min", 0.0))
+        eligible = free & (means[cand, 2] >= z_min)
+        if oval is not None and radius >= 0.12:
+            cx, cy, rx, ry = oval
+            px, py = means[cand, 0], means[cand, 1]
+            eligible &= ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2 <= 1.0
+        free_idx = cand[eligible]
+        if len(free_idx) == 0:
+            continue
+        sub = means[free_idx]
+        ratio = np.full(len(sub), np.inf, np.float32)
+        rid = np.full(len(sub), 0, np.uint8)
+        cf = np.zeros(len(sub), np.float32)
         for p in pts:
             d = np.linalg.norm(sub - p[None, :], axis=1)
-            ratio = d / radius
-            upd = ratio < best_ratio[cand]
-            best_ratio[cand[upd]] = ratio[upd]
-            ids[cand[upd]] = REGION_IDS[region]
-            conf[cand[upd]] = np.clip(1.0 - ratio[upd], 0.0, 1.0)
-
-    keep = best_ratio <= 1.0
-    ids[~keep] = 0
-    conf[~keep] = 0.0
+            r = d / radius
+            upd = r < ratio
+            ratio[upd] = r[upd]
+            cf[upd] = np.clip(1.0 - r[upd], 0.0, 1.0)
+        hit = ratio <= 1.0
+        ids[free_idx[hit]] = REGION_IDS[region]
+        conf[free_idx[hit]] = cf[hit]
+        best_ratio[free_idx[hit]] = ratio[hit]
+        frozen = free_idx[ratio < 0.95]                          # 具体区域认领后不再让渡
+        fm = np.isin(cand, frozen)
+        free &= ~fm
     return ids, conf
 
 

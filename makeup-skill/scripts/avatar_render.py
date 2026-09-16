@@ -74,7 +74,7 @@ def _background(w: int, h: int) -> np.ndarray:
 class AvatarRenderer:
     """一个画像一个实例；相机绕脸中心（归一化空间原点）轨道旋转，看 -Z 视向。"""
 
-    def __init__(self, av, env: str = "neutral", max_gaussians: int = 60000):
+    def __init__(self, av, env: str = "neutral", max_gaussians: int = 130000):
         self.av = av.decimated(max_gaussians)
         av = self.av
         self.rot = _quat_to_rot(av.quats)
@@ -241,7 +241,7 @@ def front_frame_fn(av, size: int = 512):
     返回 (BGR 图, 深度图, 焦距px, 相机距离)。深度图由最近点云 z-buffer 累积。
     """
     def render_fn():
-        r = AvatarRenderer(av, max_gaussians=60000)
+        r = AvatarRenderer(av, max_gaussians=130000)
         avd = r.av
         f = size * 1.85
         cam_dist = 2.3

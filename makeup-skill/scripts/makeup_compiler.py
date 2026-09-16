@@ -34,6 +34,10 @@ HEX2RGB = lambda h: np.array([int(h.lstrip("#")[0:2], 16),
                               int(h.lstrip("#")[2:4], 16),
                               int(h.lstrip("#")[4:6], 16)], np.float32) / 255.0
 
+# 溅射参数在 spec 里是米制（以真脸高 0.22m 为基准，同 preview_render.FACE_HEIGHT_M）；
+# 画像归一化空间脸高=1，需换算（不换算 σ 会小 4.5 倍，溅射几乎不可见）
+FACE_HEIGHT_M = 0.22
+
 
 def ramp_color(stops: list[dict], t: np.ndarray | float) -> np.ndarray:
     """color_stops 渐变采样（与 preview_render.sample_ramp 同语义）。t: (...) → (...,3)"""
@@ -103,6 +107,9 @@ def compile_tint(av, ids: np.ndarray, layers: list[dict]) -> np.ndarray:
             g = np.random.default_rng(seed).normal(1.0, 0.12 * grain, len(sel))
             col = np.clip(col * g[:, None], 0, 1)
         a = np.clip(cov * float(layer.get("opacity", 0.7)), 0, 1)
+        if region == "highlight":
+            # 高光的真实观感是镜面光泽（Unity 实时渲染/后续 SH 层负责），tint 只留轻提色
+            a = np.minimum(a, 0.10)
 
         out_a = tint[sel, 3]
         new_a = np.clip(a + out_a * (1 - a), 0, 1)
@@ -127,7 +134,7 @@ def compile_add_splats(av, ids: np.ndarray, layers: list[dict],
         if len(sel) == 0:
             continue
         splat = layer.get("render", {}).get("splat") or {}
-        th = float(splat.get("thickness", 0.0012))
+        th = float(splat.get("thickness", 0.0012)) / FACE_HEIGHT_M    # 米 → 归一化单位
         dens = float(splat.get("density", 0.7))
         stride = max(1, int(round(1.0 / max(dens, 0.05))))
         stride = max(stride, int(np.ceil(len(sel) / 1200)))   # 单层附加高斯 ≤1200（App 实例化批预算）
@@ -135,6 +142,7 @@ def compile_add_splats(av, ids: np.ndarray, layers: list[dict],
         scale_all = av.scales[sel]
         pts = pts_all[::stride]
         stops = layer["color_stops"]
+        rng = np.random.default_rng(zlib.crc32(layer["id"].encode()) & 0xFFFF)
         span = max(len(pts) - 1, 1)
         k = 0
         for p, sc in zip(pts, scale_all[::stride]):
@@ -144,17 +152,19 @@ def compile_add_splats(av, ids: np.ndarray, layers: list[dict],
             if np.linalg.norm(t) < 1e-6:
                 t = np.cross(nrm, np.array([1.0, 0.0, 0.0]))
             t /= np.linalg.norm(t) + 1e-9
-            frac = k / span
-            col = ramp_color(stops, np.array([1.0 - frac], np.float32))[0]
-            out.append({
-                "pos": [round(float(v), 5) for v in (p + nrm * th)],
-                "normal": [round(float(v), 5) for v in nrm],
-                "axis": [round(float(v), 5) for v in t],
-                "sigma": [round(th * 1.6, 6), round(th * 1.2, 6)],
-                "color": "#{:02X}{:02X}{:02X}".format(*(int(round(c * 255)) for c in col)),
-                "alpha": round(min(float(layer.get("opacity", 0.7)) * dens, 1.0), 3),
-            })
-            k += 1
+        frac = k / span
+        col = ramp_color(stops, np.array([1.0 - frac], np.float32))[0]
+        # 薄珠光层：σ 取厚度的 ~0.8×（6σ 全宽 ≈ 5×厚度），α 打折并抖动 → 光泽而非色块
+        out.append({
+            "pos": [round(float(v), 5) for v in (p + nrm * th)],
+            "normal": [round(float(v), 5) for v in nrm],
+            "axis": [round(float(v), 5) for v in t],
+            "sigma": [round(th * 0.8, 6), round(th * 0.6, 6)],
+            "color": "#{:02X}{:02X}{:02X}".format(*(int(round(c * 255)) for c in col)),
+            "alpha": round(min(float(layer.get("opacity", 0.7)) * dens * 0.6
+                               * float(rng.uniform(0.7, 1.3)), 0.9), 3),
+        })
+        k += 1
     return out
 
 

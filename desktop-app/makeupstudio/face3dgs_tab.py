@@ -124,7 +124,8 @@ class FitWorker(QThread):
                 isolate_face(result, face_ply)
             fitter = FaceMakeupFitter()
             fit = fitter.fit(result, self.spec, OUT_DIR / "fitted",
-                             face_ply=face_ply, intensity=self.intensity)
+                             face_ply=face_ply, intensity=self.intensity,
+                             densify=True)
             self.done.emit(str(fit.ply_path), str(fit.previews[0]) if fit.previews else "")
         except Exception:
             self.failed.emit(traceback.format_exc())

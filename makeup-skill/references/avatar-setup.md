@@ -59,7 +59,21 @@ preview` 自动按此优先级处理）：
 foundation 0.30 / concealer 0.075 / contour 0.085 / eyebrow 0.045 / eyeshadow 0.062 /
 eyeliner 0.022 / blush 0.16 / highlight 0.055 / lipstick 0.052。
 
-## 三、常用命令速查
+## 三、没有真画像？先用类真人雕刻头像联调
+
+`preview/sculpt_face_avatar.py` 生成参数化的"类真人"3DGS 头像（24 万微小高斯，带鼻梁/
+眼窝/眉弓/唇体/发型与肤色场，σ 相互重叠消摩尔纹），并导出与特征精确对齐的锚点 JSON——
+不依赖 mediapipe 和网络，可离线走通 register→preview→station 全流程，也是渲染/编译的
+性能基准（编译 <1s，512px 软件光栅 ~1.5s/帧）：
+
+```bash
+python preview/sculpt_face_avatar.py --out out/demo/avatar-face
+python <skill_dir>/scripts/avatar_session.py preview \
+    --ply out/demo/avatar-face/avatar.ply --work-dir out/demo/avatar-face \
+    --spec presets/date-rose.json --anchors out/demo/avatar-face/anchors.json
+```
+
+## 四、常用命令速查
 
 ```bash
 python <skill_dir>/scripts/avatar_session.py register --ply 我的画像.ply --name 我的画像

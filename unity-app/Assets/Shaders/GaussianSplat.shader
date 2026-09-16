@@ -2,13 +2,17 @@
 // SplatLayerRenderer 每帧按视深排序后用 Graphics.RenderMeshInstanced 批量绘制：
 // 每实例矩阵 = 切平面朝向（长轴沿唇线/区域走向，短轴垂直）× 3σ 尺寸；
 // 每实例颜色 _Color（a=核峰值 alpha）走 MaterialPropertyBlock 数组。
-// 全局：_MakeupIntensity（滑杆）、_FacePresence（丢脸淡出）、_EnvTint（环境色温）。
+// 每实例 _Spec = CPU 侧按真实视角算好的 Blinn-Phong 镜面（唇釉/珠光的高光），
+// 不传该数组（SplatLayerRenderer 旧路径）时缺省 0，观感与旧版一致。
+// 全局：_MakeupIntensity（滑杆）、_FacePresence（丢脸淡出）、_EnvTint（环境色温）、
+//       _SpecStrength（镜面总开关/强度）。
 Shader "MakeupMirror/GaussianSplat"
 {
     Properties
     {
         _Color ("Color (a = peak alpha)", Color) = (0.8, 0.3, 0.35, 0.7)
         _Sharpness ("Kernel sharpness", Range(0.5, 2.0)) = 1.0
+        _SpecStrength ("Specular strength", Range(0, 1)) = 0.5
     }
     SubShader
     {
@@ -32,9 +36,11 @@ Shader "MakeupMirror/GaussianSplat"
             float _FacePresence;
             float4 _EnvTint;
             float _EnvStrength;
+            float _SpecStrength;
 
             UNITY_INSTANCING_BUFFER_START(Props)
                 UNITY_DEFINE_INSTANCED_PROP(fixed4, _Color)
+                UNITY_DEFINE_INSTANCED_PROP(float, _Spec)
             UNITY_INSTANCING_BUFFER_END(Props)
 
             struct appdata
@@ -70,6 +76,9 @@ Shader "MakeupMirror/GaussianSplat"
                 float r2 = dot(d, d) * _Sharpness;
                 float g = exp(-r2 * 0.5);
                 c.rgb *= lerp(float3(1, 1, 1), saturate(_EnvTint.rgb), saturate(_EnvStrength));
+                // 镜面提亮加在环境色温之后（高光本身不受色温压制），随 alpha 衰减
+                float spec = UNITY_ACCESS_INSTANCED_PROP(Props, _Spec) * _SpecStrength * g;
+                c.rgb = saturate(c.rgb + spec * (0.5 + 0.5 * c.rgb));
                 c.a = saturate(c.a * g) * _MakeupIntensity * _FacePresence;
                 return c;
             }

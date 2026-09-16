@@ -98,7 +98,8 @@ unity-app/             Assets/Scripts（15 个 C#：主入口、Bridge、画像�
                        摄像头/中继/环境光、指导显示+TTS）、Assets/Shaders（4 个 shader，含
                        GaussianAvatarSplat EWA 光栅）、StreamingAssets、tools/（face_tracker +
                        tracking_protocol）、docs/assembly.md
-preview/               recorder_app.py、run_demo_session.py、face_render.py(薄封装)、render_demo_video.py
+preview/               recorder_app.py、run_demo_session.py、face_render.py(薄封装)、render_demo_video.py、
+                       sculpt_face_avatar.py(类真人雕刻头像：离线联调/渲染基准，产出锚点 JSON)
 tests/                 pytest 套件（84 项，含 check_csharp.py 静态回归）
 out/demo/              makeup-demo.mp4 演示视频
 ```
@@ -124,3 +125,34 @@ out/demo/              makeup-demo.mp4 演示视频
 - 画像表情驱动（P6）：FLAME 系数 rig → 画像 Gaussian 蒙皮（静态画像渲染已就绪，rig 接口已留）
 - ~~FLAME 3DMM 精确拟合~~（并入画像架构：LAM/扫描产物即 FLAME-rig 画像）
 - iOS/Android 移植（ARKit/ARCore 前置摄像头 + 原生人脸追踪替代 sidecar）
+
+## 3DGS 妆容管线升级（P0/P1/P2，2026-09）
+
+对标 AvatarMakeup（arXiv 2507.02419）/ GaussianAvatars / Stable-Makeup 的三步落地：
+
+- **P0 烘焙质量**（`face3dgs/fit_makeup.py`、`splat3d.py`）
+  - kNN 距离加权 UV 归属 + 跨 UV 岛保护 + 离群剔除（头发/背景永不涂妆）；
+  - `densify=True` 妆区克隆小 σ 子高斯（≤35%），唇线/眼线锐化；
+  - 蒙版烘焙提到 1024（`FIT_TEX`）；`splat3d` 新增 alpha² 加权超细细节层；
+  - finish 物理化：逐点 gloss/shininess 烘进点云，三条渲染路径（Python 预览 /
+    WebGL viewer / Unity `GaussianSplat` shader）按真实视角加 Blinn-Phong +
+    fresnel sheen——唇釉/珠光高光随视角流动，不再是 opacity 增益；
+  - 修复 `splat3d.build` 烘焙缓存 key 撞车（同层数不同 spec → 妆容整体消失）。
+- **P1 外观与参数解耦**（`face3dgs/fit_makeup.apply_guidance` + `face3dgs/guidance.py`）
+  - 妆容外观可改由 guidance 图（Stable-Makeup 等 2D 迁移模型输出）多视角投影
+    采样（逐通道中位数聚合），参数化 spec 降级为区域门控 + 强度滑杆；
+  - Stable-Makeup 走与 FlashAvatar 相同的门控适配约定（`status()` 可执行提示 +
+    conda 独立环境），环境不齐时自动回退参数化路径。
+- **P2 FLAME 底座接缝**（`face3dgs/fit_makeup.fit_canonical`）
+  - canonical 姿态点云（FlashAvatar 适配器导出）零配准直接上妆，
+    `fit_report.mode="canonical"`；表情/动画一致性的底座已就位。
+- 验收图：`python preview/compare_bare_vs_makeup.py` → `out/compare/` 两张
+  素颜/妆容对比（合成 3DGS 正/侧视 + fit_canonical 特写，含唇釉镜面）。
+- **真实数据全链路已验证**（`preview/run_real_fit.py`）：真人视频 → pycolmap 增量
+  SfM（稀疏点+位姿）→ MediaPipe 468 地标 DLT 三角化 → 真实地标替换 canonical
+  顶点重建稠密脸形 → 多视角投影采样真实视频肤色 → 上妆（Lab 迁移+densify+镜面）
+  → `out/compare/compare_real_fit.png`。过程中修复三个真实场景才暴露的 bug：
+  DLT 缺 Hartley 归一化 + 齐次符号翻转（COLMAP 大尺度世界坐标下地标全部跑 to
+  相机后方）；`colmap_io` 相机模型 id 只认本仓库 fork（新增 standard 方言自动探测）；
+  `apply_makeup/apply_guidance` 现在优先使用 cloud 自带精确 UV（非刚性真实脸下
+  Kabsch 相似变换会有 ~5% 局部错位）。

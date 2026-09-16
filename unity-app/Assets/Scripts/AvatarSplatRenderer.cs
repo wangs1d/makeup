@@ -18,6 +18,10 @@ namespace MakeupMirror
         [Range(0f, 0.9f)] public float viewBlend = 0.35f;
         [Tooltip("强度（预览确认值 enter_station 后由 look.intensity 驱动）")]
         [Range(0f, 1f)] public float intensity = 1f;
+        [Tooltip("镜面强度总开关（唇釉/珠光的高光，逐帧按真实视角 CPU 计算）")]
+        [Range(0f, 1f)] public float specStrength = 0.45f;
+        [Tooltip("光源方向（世界系，Blinn-Phong 用）")]
+        public Vector3 lightDir = new Vector3(0.30f, 0.55f, 0.80f);
 
         public int Count => _count;
 
@@ -28,6 +32,7 @@ namespace MakeupMirror
             public Vector3 axis;     // 切向长轴
             public Vector2 sigma;    // 归一化单位（脸高=1）
             public Vector4 color;    // rgb + peak alpha
+            public float gloss;      // 0..1 镜面强度（add_splats.json 的 gloss，缺省 0.35）
         }
 
         private const int Batch = 1023;
@@ -36,6 +41,8 @@ namespace MakeupMirror
         private Matrix4x4[] _matrices = Array.Empty<Matrix4x4>();
         private Vector4[] _colorsSorted = Array.Empty<Vector4>();
         private readonly Vector4[] _colorsBatch = new Vector4[Batch];
+        private float[] _specSorted = Array.Empty<float>();
+        private readonly float[] _specBatch = new float[Batch];
         private float[] _depthKeys = Array.Empty<float>();
         private int[] _order = Array.Empty<int>();
         private Mesh _quad;
@@ -43,6 +50,8 @@ namespace MakeupMirror
         private MaterialPropertyBlock _mpb;
         private static readonly int ColorId = Shader.PropertyToID("_Color");
         private static readonly int IntensityId = Shader.PropertyToID("_MakeupIntensity");
+        private static readonly int SpecId = Shader.PropertyToID("_Spec");
+        private static readonly int SpecStrengthId = Shader.PropertyToID("_SpecStrength");
 
         private void Awake()
         {
@@ -79,11 +88,13 @@ namespace MakeupMirror
                     sigma = new Vector2(sig?[0]?.Value<float?>() ?? 0.0015f,
                                         sig?[1]?.Value<float?>() ?? 0.0012f),
                     color = new Vector4(col.r, col.g, col.b, s.Value<float?>("alpha") ?? 0.7f),
+                    gloss = s.Value<float?>("gloss") ?? 0.35f,
                 });
             }
             _count = _splats.Count;
             _matrices = new Matrix4x4[_count];
             _colorsSorted = new Vector4[_count];
+            _specSorted = new float[_count];
             _depthKeys = new float[_count];
             _order = new int[_count];
             if (_mat == null)
@@ -141,10 +152,16 @@ namespace MakeupMirror
                 _depthKeys[i] = -Vector3.Dot(p - camPos, camFwd);
                 _matrices[i] = m;
                 _colorsSorted[i] = s.color;
+                // Blinn-Phong 逐帧 CPU 计算（相机/光源每帧变化；数量 ≤ 数千，开销可忽略）
+                var L = lightDir.sqrMagnitude < 1e-6f ? new Vector3(0.3f, 0.55f, 0.8f) : lightDir.normalized;
+                var H = (L + toCam).normalized;
+                float ndh = Mathf.Clamp01(Vector3.Dot(n, H));
+                _specSorted[i] = s.gloss * Mathf.Pow(ndh, 90f);
             }
             Array.Sort(_depthKeys, _order);
 
             _mat.SetFloat(IntensityId, intensity);
+            _mat.SetFloat(SpecStrengthId, specStrength);
             var bounds = new Bounds(transform.position, Vector3.one * 1.5f);
             var rp = new RenderParams(_mat)
             {
@@ -159,8 +176,13 @@ namespace MakeupMirror
                 for (int start = 0; start < _count; start += Batch)
                 {
                     int n = Mathf.Min(Batch, _count - start);
-                    for (int k = 0; k < n; k++) _colorsBatch[k] = _colorsSorted[_order[start + k]];
+                    for (int k = 0; k < n; k++)
+                    {
+                        _colorsBatch[k] = _colorsSorted[_order[start + k]];
+                        _specBatch[k] = _specSorted[_order[start + k]];
+                    }
                     _mpb.SetVectorArray(ColorId, _colorsBatch);
+                    _mpb.SetFloatArray(SpecId, _specBatch);
                     Graphics.RenderMeshInstanced(rp, _quad, 0, _matrices, n, start);
                 }
             }

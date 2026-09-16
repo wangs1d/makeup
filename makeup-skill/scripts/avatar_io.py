@@ -47,10 +47,12 @@ class AvatarData:
         return int(self.means.shape[0])
 
     def decimated(self, max_count: int) -> "AvatarData":
-        """等间隔抽稀（保序，用于预览提速；App 端另有抽稀旋钮）。"""
+        """随机抽稀（保数量）。等距抽稀会保留斐波那契/扫描点的相干结构，渲染出摩尔纹；
+        随机子采样打散相干性，σ 重叠不变。种子固定保证 register/compile 两端一致。"""
         if self.n <= max_count:
             return self
-        idx = np.linspace(0, self.n - 1, max_count).astype(np.int64)
+        rng = np.random.default_rng(0)
+        idx = np.sort(rng.choice(self.n, max_count, replace=False))
         return AvatarData(self.means[idx], self.scales[idx], self.quats[idx],
                           self.colors[idx], self.opacities[idx],
                           self.face_height, self.raw_min, self.raw_max, self.meta)
