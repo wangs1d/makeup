@@ -1,0 +1,61 @@
+// GaussianAvatarSort.compute — 3DGS 深度键计算 + GPU bitonic 排序。
+// 取代 CPU 侧「GetData 回读 + Array.Sort」（12 万 splat ~8ms 且有同步停顿）：
+// DepthKeys 核按相机深度写键并初始化索引（越界补 +∞ 键让 padding 排到末尾，
+// 即“最近”，最后渲染不影响混合），Bitonic 核做标准双调排序（升序 = 远→近），
+// 结果索引由 GaussianAvatarRenderer 直接 CopyBuffer 进渲染用 _Order。
+#pragma kernel DepthKeys
+#pragma kernel Bitonic
+
+StructuredBuffer<float3> _Positions;
+float4x4 _RootMatrix;
+float3 _CamPos;
+float3 _CamFwd;
+uint _Count;
+uint _N2;                       // 2 的幂 ≥ _Count
+RWStructuredBuffer<float> _KeysA;
+RWStructuredBuffer<uint> _IdxA;
+
+[numthreads(256, 1, 1)]
+void DepthKeys(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N2) return;
+    if (i >= _Count)
+    {
+        _KeysA[i] = 3.4e38f;    // padding：升序末尾 = 最近，多画无贡献
+        _IdxA[i] = 0u;
+        return;
+    }
+    float3 w = mul(_RootMatrix, float4(_Positions[i], 1)).xyz;
+    _KeysA[i] = -dot(w - _CamPos, _CamFwd);   // 远 → 负；升序 = 远→近
+    _IdxA[i] = i;
+}
+
+StructuredBuffer<float> _KeysIn;
+StructuredBuffer<uint> _IdxIn;
+RWStructuredBuffer<float> _KeysOut;
+RWStructuredBuffer<uint> _IdxOut;
+uint _K;                        // 当前归并宽度
+uint _J;                        // 当前比较步长
+
+[numthreads(256, 1, 1)]
+void Bitonic(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _N2) return;
+    uint j = i ^ _J;
+    if (j <= i) return;                        // 每对只由较小索引处理
+    float ki = _KeysIn[i], kj = _KeysIn[j];
+    uint ii = _IdxIn[i], ij = _IdxIn[j];
+    bool ascending = (i & _K) == 0u;           // 块内方向
+    if ((ki > kj) == ascending)
+    {
+        _KeysOut[i] = kj; _KeysOut[j] = ki;
+        _IdxOut[i] = ij; _IdxOut[j] = ii;
+    }
+    else
+    {
+        _KeysOut[i] = ki; _KeysOut[j] = kj;
+        _IdxOut[i] = ii; _IdxOut[j] = ij;
+    }
+}

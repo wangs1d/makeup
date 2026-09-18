@@ -46,8 +46,20 @@ def read_ply(path: str | Path) -> dict[str, np.ndarray]:
     rgb = 0.5 + SH_C0 * np.stack([col(f"f_dc_{k}") for k in range(3)], axis=1)
     alpha = 1.0 / (1.0 + np.exp(-col("opacity")))
     rgba = np.concatenate([np.clip(rgb, 0, 1), alpha[:, None]], axis=1)
-    return {"xyz": xyz.astype(np.float32), "scale": scale.astype(np.float32),
-            "rot": rot.astype(np.float32), "rgba": rgba.astype(np.float32)}
+    out = {"xyz": xyz.astype(np.float32), "scale": scale.astype(np.float32),
+           "rot": rot.astype(np.float32), "rgba": rgba.astype(np.float32)}
+    # SH 高阶（f_rest_*）存在时按 3DGS 通道主序读回 (n, pc, 3)，随资产贯穿
+    # 妆容烘焙/再导出（逐 splat 妆容只改 DC，高阶保持底模视角相关外观）。
+    rest_names = sorted((nm for nm in dtype.names if nm.startswith("f_rest_")),
+                        key=lambda nm: int(nm.split("_")[-1]))
+    if rest_names:
+        n_rest = len(rest_names)
+        if n_rest % 3 == 0:
+            fr = np.stack([data[nm].astype(np.float32) for nm in rest_names], axis=1)
+            pc = n_rest // 3
+            out["sh_rest"] = np.stack([fr[:, c * pc:(c + 1) * pc] for c in range(3)],
+                                      axis=2).astype(np.float32)
+    return out
 
 
 def write_ply(cloud: dict[str, np.ndarray], path: str | Path) -> None:

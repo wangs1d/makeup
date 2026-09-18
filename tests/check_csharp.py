@@ -193,16 +193,30 @@ def test_avatar_parser_and_renderer():
     for token in ("binary_little_endian", "f_dc_0", "opacity", "rot_0",
                   "2.2f", "Mathf.Exp", "MKMK", "LoadTint", "LoadPly"):
         assert token in parser, f"parser 缺少 {token}"
+    # R+ 升级：SH 高阶解析 + MKLT1 主光 sidecar
+    for token in ("f_rest_", "ShRest", "MKLT", "LoadLight"):
+        assert token in parser, f"parser 缺少 {token}"
     renderer = text(SCRIPTS / "GaussianAvatarRenderer.cs")
-    for token in ("ComputeBuffer", "ApplyTint",
+    for token in ("ComputeBuffer", "ApplyTint", "ApplyMaterial", "ApplyLight",
                   "Array.Sort(_depthKeys, _orderCpu)", "DrawProceduralNow",
-                  "_RootMatrix", "ClearTint", "resortIntervalFrames"):
+                  "_RootMatrix", "ClearTint", "resortIntervalFrames",
+                  "GpuResort", "_shRest", "_Relight"):
         assert token in renderer, f"renderer 缺少 {token}"
     shader = text(SHADERS / "GaussianAvatarSplat.shader")
-    for token in ("StructuredBuffer<float4> _Tints", "StructuredBuffer<int>   _Order",
+    for token in ("StructuredBuffer<float4> _Tints", "StructuredBuffer<uint>   _Order",
+                  "StructuredBuffer<float3> _ShRest",
                   "_MakeupIntensity", "_FocalPx", "Blend One OneMinusSrcAlpha",
-                  "premultiplied", "exp(-0.5"):
+                  "premultiplied", "exp(-0.5",
+                  # 片元级 PBR：全精度插值器（COLOR0 会被钳制）、SH 求值、2.5σ、relight 门控
+                  "ShEvalDeg2", "QuadSigma = 2.5", "_Relight",
+                  "col : TEXCOORD1"):
         assert token in shader, f"avatar shader 缺少 {token}"
+    assert "COLOR0" not in shader, "高光 HDR 输出不得走 COLOR0（会被钳制）"
+    # GPU bitonic 排序 compute：双核 + ping-pong
+    comp = text(SCRIPTS / "GaussianAvatarSort.compute")
+    for token in ("#pragma kernel DepthKeys", "#pragma kernel Bitonic",
+                  "_KeysIn", "_KeysOut", "_IdxIn", "_IdxOut", "_CamFwd"):
+        assert token in comp, f"sort compute 缺少 {token}"
 
 
 def test_avatar_station_flow_state_machine():
@@ -214,6 +228,9 @@ def test_avatar_station_flow_state_machine():
     for token in ("avatar_register", "avatar_preview", "avatar_confirm",
                   "enter_station", "leave_station", "station_state"):
         assert token in flow, f"flow 缺少消息 {token}"
+    # 注册时拉取 PBR 材质与主光 sidecar（否则 Unity 端材质永远不生效）
+    for token in ("material.bin", "light.bin", "ApplyMaterial", "ApplyLight"):
+        assert token in flow, f"flow 缺少 sidecar 接线 {token}"
     # 妆容台布局：画像侧栏参照
     assert "stationPosition" in flow and "previewPosition" in flow
     splats = text(SCRIPTS / "AvatarSplatRenderer.cs")

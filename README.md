@@ -1,14 +1,49 @@
-# Makeup Assistant —— 3DGS 画像试妆 + AI 化妆助手
+# Makeup Assistant —— 3DGS 数字资产试妆 + AI 化妆助手
 
-协助女生化妆的应用原型，两部分组成：
+协助女生化妆的应用原型。**产品主链路**（R 写实化重构后）：
+
+```
+上传视频 / 摄像头环绕扫描 ─→ 抽帧 + SfM(pycolmap) ─→ gsplat 光度训练（表情一致帧）
+                          ─→ 3DGS 数字资产（base.ply，20万+ 高斯，~4 分钟）
+换妆 ─→ UV 目标场合成 + 3D 唇锚定 + PBR 材质 ─→ madeup.ply/.splat + material.bin（秒级）
+```
 
 | 部分 | 说明 |
 |---|---|
-| **[makeup-skill/](makeup-skill/)** | ★ Agent Skill 能力包（`SKILL.md` + Python 工具 + 妆容预设 + 协议文档）。整个目录即为分发形态：agent 下载后放入自己的 skills 目录即可识别调用 |
-| **[unity-app/](unity-app/)** | Windows 桌面试妆 App（Unity 2022 LTS）。**画像妆容台流程**（P5）：用户上传 3DGS 画像 → 选妆在画像上预览（EWA 高斯光栅 + 妆容 tint）→ 确认 → 进妆容台辅助化妆（画像侧栏参照 + 摄像头画面供 VLM 指导，真脸零渲染） |
-| **[preview/](preview/)** | 演示与联调工具：真实 Bridge 会话录制器 + Python 预览渲染器（免 Unity 预览效果 / 生成演示视频） |
+| **[desktop-app/makeupstudio/](desktop-app/)** | ★ 核心：写实试妆管线（`face3dgs/appearance/`：选帧/训练/UV 妆容/PBR/评测）+ 桌面 App（PySide6，采集→建模→贴妆三步走）+ CLI（`python -m makeupstudio.face3dgs asset|makeup`） |
+| **[makeup-skill/](makeup-skill/)** | Agent Skill 能力包（`SKILL.md` + 妆容预设 + spec schema + Bridge 协议）：妆容解析（VLM）与实时化妆协助 |
+| **[unity-app/](unity-app/)** | Windows 桌面试妆 App（Unity 2022 LTS）：3DGS 画像 EWA 高斯光栅渲染，`GaussianAvatarParser.LoadMaterial` 消费 MKMA 材质 sidecar 做 PBR |
+| **[preview/](preview/)** | CLI：`run_photoreal.py`（上传视频全自动 / 已有工程分步）+ 演示工具 |
 
-▶ **效果演示视频**：[out/demo/makeup-demo.mp4](out/demo/makeup-demo.mp4)（54s，真实 Bridge 协议会话的离线复现，含 live_coach 离线陪练章节）
+▶ 效果对比图：[out/compare/photoreal_3views.png](out/compare/photoreal_3views.png)（真实帧|素颜|妆后 三视角）· [out/compare/photoreal_lip_zoom.png](out/compare/photoreal_lip_zoom.png)（唇部特写）
+
+## 快速开始（产品主链路）
+
+```bash
+# 0) 环境：CUDA GPU + pip install torch gsplat pycolmap（详见 docs/photoreal-pipeline.md）
+cd desktop-app && python -m makeupstudio.face3dgs status   # 环境自检
+
+# 1) 资产化（二选一）
+#    a. 摄像头环绕扫描（桌面 App 内点击，或 CLI 引导式采集）
+cd desktop-app && python -m makeupstudio.face3dgs capture -o ../out/face3dgs/me.mp4
+#    b. 上传视频全自动：抽帧 → SfM → gsplat 训练 → base.ply
+python preview/run_photoreal.py --video 我的视频.mp4 \
+    --project out/scan --spec makeup-skill/presets/date-rose.json --out out/photoreal/me
+
+# 2) 换妆（秒级，复用资产）
+cd desktop-app && python -m makeupstudio.face3dgs makeup -p ../out/scan \
+    --spec ../makeup-skill/presets/date-rose.json
+```
+
+## 旧链路退役说明
+
+R 写实化重构（2026-09，详见 [docs/photoreal-pipeline.md](docs/photoreal-pipeline.md)）退役了以下路径，代码已删除或归入语义工具层：
+- `preview/run_real_fit.py` / `preview/compare_bare_vs_makeup.py`（模板面具链路 CLI）
+- `fit_makeup.py` 的模板染色（apply_makeup）、程序化壳层（build_makeup_shell）、fit/fit_canonical/apply_guidance 旧入口、render_cloud 旧渲染器——**保留**三角化/配准/唇拓扑/唇带权重/UV 归属（新链路的语义基础设施）
+- `reconstruct.py` 的 Brush 重建链路（FFmpeg+COLMAP+Brush 引擎依赖）→ 被 pycolmap SfM + gsplat 训练取代（`reconstruct.py`/`isolate.py` 保留为参考实现，主链路不再依赖）
+- desktop-app "我的 3D 脸"标签页：ReconWorker/FitWorker → ModelWorker（扫描建模）/MakeupWorker（贴妆）
+
+三大能力中的 **妆容素材解析**（VLM → makeup_spec.json）与 **实时化妆协助**（进度跟踪/TTS/报告）流程不变，产物 spec 直接喂给新链路的妆容合成。
 
 ## 三大能力
 
@@ -126,9 +161,46 @@ out/demo/              makeup-demo.mp4 演示视频
 - ~~FLAME 3DMM 精确拟合~~（并入画像架构：LAM/扫描产物即 FLAME-rig 画像）
 - iOS/Android 移植（ARKit/ARCore 前置摄像头 + 原生人脸追踪替代 sidecar）
 
-## 3DGS 妆容管线升级（P0/P1/P2，2026-09）
+## 3DGS 妆容管线写实化重构（R0-R3，2026-09）
 
-对标 AvatarMakeup（arXiv 2507.02419）/ GaussianAvatars / Stable-Makeup 的三步落地：
+对照旧链路效果不逼真的四个根因（模板面具底模 / 退化重建 / 逐 splat 涂色 /
+玩具级光照）做的架构级重构，详见 [docs/photoreal-pipeline.md](docs/photoreal-pipeline.md)：
+
+- **R0 表情一致选帧 + gsplat 光度训练**（`appearance/frames.py`、`train_base.py`）
+  - 单目说话视频中表情剧烈变化是 3DGS densify 崩塌的第一根因（历史产物
+    仅 1918 高斯）→ MediaPipe 嘴开度窄带（贴中位数 ±0.025）+ MAD 表情聚类，
+    只训主表情簇；
+  - gsplat 30k iter 全参数训练（densify/split/opacity-reset），脸区凸包蒙版
+    聚焦，产出 20 万+ 高斯的真 3DGS 底模；后处理剪枝（蒙版外漂浮物/巨块/低
+    透明度）。8GB 显存 ~4 分钟。
+- **R1 UV 空间妆容**（`appearance/uvbind.py`、`makeup_uv.py`）
+  - canonical UV/区域覆盖绑定为点云一等属性，妆容在 2048² UV 目标场合成
+    （albedo/rough/coat/sss/sheen/kL/chroma），Lab 部分迁移烘焙——皮肤纹理
+    与原生光影保留；系数逐区域（底妆只匀肤，唇/腮红强色度）；
+  - **唇妆 3D 锚定**：canonical 模板唇带与真实唇有 ~2% 错位（唇是高频小区域，
+    UV 路径不可接受）→ 复用 fit_makeup L0 观测唇域锚定（三角化真实地标 +
+    颜色门控），UV 唇带降级为兜底；
+  - 微观纹理（唇纹/粉感）第一次有来源；`optimize.py` 预留 Stable-Makeup
+    guidance 的图像空间联合求解回路（几何冻结，identity 锁）。
+- **R2 PBR 化妆品材质**（`appearance/pbr.py`、Unity `GaussianAvatarSplat.shader`）
+  - 逐 splat 材质通道：rough（粉↑釉↓）/ coat（唇釉清漆 + Schlick Fresnel）/
+    sss（唇部背光透光红移）/ sheen（珠光绒光），Python/Unity 同式实现；
+  - 导出 `material.bin`（MKMA v1：法线+材质，`GaussianAvatarParser.LoadMaterial`）。
+- **R3 客观指标**（`appearance/bench.py`）：留出帧 PSNR / 唇区 ΔE / 非妆区
+  ΔE（identity 锁验证），杜绝玄学迭代。
+- 环境：CUDA torch 2.9.1+cu130 + gsplat 1.5.3（源码编译，v1.5.3 上游存在
+  2DGS-bwd/from-world 内核签名不一致，已在安装中打桩绕过，主路径不受影响）。
+- 一键跑法：
+  `python preview/run_photoreal.py --project out/real --sfm out/real/sfm/sparse/3 --init out/real/project/face_dense.ply --spec makeup-skill/presets/date-rose.json --out out/photoreal/d6 --iters 30000`
+
+## 3DGS 妆容管线升级（P0/P1/P2，2026-09）〔已退役，被 R 写实化重构取代〕
+
+> 本节描述的模板染色/壳层路径已随 R 重构退役（保留的思想被继承）：
+> kNN UV 归属 + 跨岛保护 + 离群剔除 → `appearance/uvbind.py`；唇红带 3D 拓扑 +
+> 观测锚定 + 颜色门控 → `fit_makeup.FaceMakeupFitter`（appearance 消费）；
+> guidance 多视角聚合思想 → `appearance/optimize.py`（图像空间联合求解）；
+> DLT Hartley 归一化/cheirality、colmap_io standard 方言、精确 UV 优先等
+> 真实场景修复全部保留在新链路。原 P0/P1/P2 细节见 git 历史。
 
 - **P0 烘焙质量**（`face3dgs/fit_makeup.py`、`splat3d.py`）
   - kNN 距离加权 UV 归属 + 跨 UV 岛保护 + 离群剔除（头发/背景永不涂妆）；
@@ -146,13 +218,3 @@ out/demo/              makeup-demo.mp4 演示视频
 - **P2 FLAME 底座接缝**（`face3dgs/fit_makeup.fit_canonical`）
   - canonical 姿态点云（FlashAvatar 适配器导出）零配准直接上妆，
     `fit_report.mode="canonical"`；表情/动画一致性的底座已就位。
-- 验收图：`python preview/compare_bare_vs_makeup.py` → `out/compare/` 两张
-  素颜/妆容对比（合成 3DGS 正/侧视 + fit_canonical 特写，含唇釉镜面）。
-- **真实数据全链路已验证**（`preview/run_real_fit.py`）：真人视频 → pycolmap 增量
-  SfM（稀疏点+位姿）→ MediaPipe 468 地标 DLT 三角化 → 真实地标替换 canonical
-  顶点重建稠密脸形 → 多视角投影采样真实视频肤色 → 上妆（Lab 迁移+densify+镜面）
-  → `out/compare/compare_real_fit.png`。过程中修复三个真实场景才暴露的 bug：
-  DLT 缺 Hartley 归一化 + 齐次符号翻转（COLMAP 大尺度世界坐标下地标全部跑 to
-  相机后方）；`colmap_io` 相机模型 id 只认本仓库 fork（新增 standard 方言自动探测）；
-  `apply_makeup/apply_guidance` 现在优先使用 cloud 自带精确 UV（非刚性真实脸下
-  Kabsch 相似变换会有 ~5% 局部错位）。

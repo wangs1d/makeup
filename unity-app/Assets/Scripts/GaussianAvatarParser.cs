@@ -19,6 +19,7 @@ namespace MakeupMirror
         public Vector4[] CovA;           // Σ 上三角打包 (xx,xy,xz,yy)
         public Vector4[] CovB;           // (yz,zz,0,0)
         public Vector4[] Colors;         // (rgb sRGB, opacity)
+        public Vector3[] ShRest;         // SH 高阶 8/splat（degree2，不足补零；null=无）
         public int Count;
     }
 
@@ -36,6 +37,14 @@ namespace MakeupMirror
                 if (!props.ContainsKey(need))
                     throw new InvalidDataException($"PLY 缺少 3DGS 必需属性：{need}");
 
+            // SH 高阶（f_rest_*，3DGS 通道主序）：支持 degree≥1 的任意前缀，
+            // 不足 8/通道补零（shader 固定按 degree2 布局取用）。
+            int restPerChannel = 0;
+            while (props.ContainsKey($"f_rest_{restPerChannel}") && restPerChannel < 45)
+                restPerChannel++;
+            bool hasSh = restPerChannel >= 3 && restPerChannel % 3 == 0;
+            int srcPerChannel = hasSh ? restPerChannel / 3 : 0;
+
             int stride = 0;
             foreach (var p in props.Values) stride += p.Size;
             if (raw.Length < dataStart + (long)count * stride)
@@ -47,6 +56,7 @@ namespace MakeupMirror
                 CovA = new Vector4[count],
                 CovB = new Vector4[count],
                 Colors = new Vector4[count],
+                ShRest = hasSh ? new Vector3[count * 8] : null,
                 Count = count,
             };
             const float shC0 = 0.28209479177387814f;
@@ -96,6 +106,16 @@ namespace MakeupMirror
                     m10 * m20 + m11 * m21 + m12 * m22,                 // yz
                     m20 * m20 + m21 * m21 + m22 * m22,                 // zz
                     0f, 0f);
+
+                if (hasSh)
+                {
+                    int b = i * 8;
+                    for (int c = 0; c < 3; c++)
+                        for (int k = 0; k < 8; k++)
+                            cloud.ShRest[b + k][c] = k < srcPerChannel
+                                ? PropFloat(raw, row, props, $"f_rest_{c * srcPerChannel + k}")
+                                : 0f;
+                }
             }
             return cloud;
         }
@@ -193,6 +213,62 @@ namespace MakeupMirror
                     BitConverter.ToSingle(raw, o + 12));
             }
             return tint;
+        }
+
+        // ---------- 主光 sidecar（MKLT1，train_base.estimate_light_dir 产出） ----------
+
+        /// <summary>light.bin：dir(世界系指向光源) + strength + tint(线性 0..1)。</summary>
+        public static void LoadLight(byte[] raw, out Vector3 dir,
+                                     out float strength, out Vector3 tint)
+        {
+            if (raw == null || raw.Length < 44)
+                throw new InvalidDataException("light.bin 过短");
+            if (raw[0] != 'M' || raw[1] != 'K' || raw[2] != 'L' || raw[3] != 'T')
+                throw new InvalidDataException("light.bin magic 不符（需要 MKLT）");
+            ushort ver = BitConverter.ToUInt16(raw, 4);
+            if (ver != 1) throw new InvalidDataException($"light.bin 版本不支持：{ver}");
+            dir = new Vector3(
+                BitConverter.ToSingle(raw, 16),
+                BitConverter.ToSingle(raw, 20),
+                BitConverter.ToSingle(raw, 24)).normalized;
+            strength = Mathf.Clamp01(BitConverter.ToSingle(raw, 28));
+            tint = new Vector3(
+                Mathf.Clamp01(BitConverter.ToSingle(raw, 32)),
+                Mathf.Clamp01(BitConverter.ToSingle(raw, 36)),
+                Mathf.Clamp01(BitConverter.ToSingle(raw, 40)));
+        }
+
+        // ---------- PBR 材质 sidecar（appearance/pipeline.export_material 产出） ----------
+
+        /// <summary>material.bin（MKMA v1）：每 splat [nx,ny,nz,rough]+[coat,sss,sheen,rsv]。</summary>
+        public static void LoadMaterial(byte[] raw, out Vector4[] normalRough,
+                                        out Vector4[] coatSssSheen)
+        {
+            if (raw == null || raw.Length < 16)
+                throw new InvalidDataException("material.bin 过短");
+            if (raw[0] != 'M' || raw[1] != 'K' || raw[2] != 'M' || raw[3] != 'A')
+                throw new InvalidDataException("material.bin magic 不符（需要 MKMA）");
+            ushort ver = BitConverter.ToUInt16(raw, 4);
+            if (ver != 1) throw new InvalidDataException($"material.bin 版本不支持：{ver}");
+            int n = BitConverter.ToInt32(raw, 8);
+            if (raw.Length < 16 + (long)n * 32)
+                throw new InvalidDataException($"material.bin 数据不完整：N={n}");
+            normalRough = new Vector4[n];      // (nx, ny, nz, rough)
+            coatSssSheen = new Vector4[n];     // (coat, sss, sheen, 0)
+            for (int i = 0; i < n; i++)
+            {
+                int o = 16 + i * 32;
+                normalRough[i] = new Vector4(
+                    BitConverter.ToSingle(raw, o),
+                    BitConverter.ToSingle(raw, o + 4),
+                    BitConverter.ToSingle(raw, o + 8),
+                    BitConverter.ToSingle(raw, o + 12));
+                coatSssSheen[i] = new Vector4(
+                    BitConverter.ToSingle(raw, o + 16),
+                    BitConverter.ToSingle(raw, o + 20),
+                    BitConverter.ToSingle(raw, o + 24),
+                    BitConverter.ToSingle(raw, o + 28));
+            }
         }
     }
 }

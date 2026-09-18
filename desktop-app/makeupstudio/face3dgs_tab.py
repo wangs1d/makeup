@@ -1,9 +1,10 @@
 """face3dgs_tab — 主窗口"我的 3D 脸"视图。
 
-流程：环绕采集（引导）→ 后台重建（引擎缺失时给出安装指引）→ 隔离脸部 →
-套用当前妆容。所有耗时步骤在 QThread 中执行，UI 只收信号。
+产品链路：环绕采集/上传视频 → 扫描建模（SfM + gsplat 光度训练 → 3DGS 数字
+资产）→ 贴妆（UV 目标场 + 3D 唇锚定，秒级，换妆不重训）。所有耗时步骤在
+QThread 中执行，UI 只收信号。
 
-布局：左侧预览画布，右侧一张步骤卡片（三步走：采集 → 重建 → 贴妆），
+布局：左侧预览画布，右侧一张步骤卡片（三步走：采集 → 建模 → 贴妆），
 每步一枚状态圆点 + 标题 + 一行状态文字 + 操作按钮。
 """
 from __future__ import annotations
@@ -20,7 +21,6 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QProgressBar,
                                QPushButton, QVBoxLayout, QWidget)
 
-from .face3dgs import engines
 from .face3dgs.capture import OrbitCaptureSession, open_camera
 from .guide_overlay import draw_capture_guidance
 
@@ -76,28 +76,44 @@ class CaptureWorker(QThread):
             self.failed.emit(traceback.format_exc())
 
 
-class ReconWorker(QThread):
+class ModelWorker(QThread):
+    """扫描建模：视频 → 抽帧 → SfM（pycolmap）→ 表情选帧 → gsplat 光度训练。"""
+
     stage = Signal(str, float, str)
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, video: str, project: Path, quality: str = "standard", parent=None):
+    def __init__(self, video: str, project: Path, iters: int = 20000, parent=None):
         super().__init__(parent)
         self.video = video
         self.project = project
-        self.quality = quality
+        self.iters = iters
 
     def run(self):
         try:
-            from .reconstruct import run_reconstruction
-            res = run_reconstruction(self.video, self.project, self.quality,
-                                     on_progress=lambda s, f, m: self.stage.emit(s, f, m))
-            self.done.emit(str(res.ply_path))
+            from .face3dgs.appearance import sfm
+            from .face3dgs.appearance.pipeline import build_asset
+            from .face3dgs.appearance.train_base import TrainConfig
+
+            images = self.project / "images"
+            images.mkdir(parents=True, exist_ok=True)
+            sfm.extract_frames(self.video, images, fps=10.0,
+                               on_progress=lambda f, m: self.stage.emit("frames", f, m))
+            result = sfm.run_sfm(images, self.project,
+                                 on_progress=lambda f, m: self.stage.emit("sfm", f, m))
+            cloud, _sel, _lm, _model, report = build_asset(
+                self.project, result.sparse_dir,
+                self.project / "images", self.project / "asset",
+                train_cfg=TrainConfig(iters=self.iters), reuse_base=False,
+                progress=lambda s, f, m: self.stage.emit(s, f, m))
+            self.done.emit(f"{len(cloud['xyz'])} 高斯 · PSNR {report.get('psnr_mean')}dB")
         except Exception as e:
             self.failed.emit(str(e) or traceback.format_exc())
 
 
-class FitWorker(QThread):
+class MakeupWorker(QThread):
+    """贴妆：在已有 3DGS 资产上合成妆容（UV 目标场 + 3D 唇锚定），秒级换妆。"""
+
     done = Signal(str, str)      # ply_path, preview_png
     failed = Signal(str)
 
@@ -109,24 +125,39 @@ class FitWorker(QThread):
 
     def run(self):
         try:
-            from .fit_makeup import FaceMakeupFitter
-            from .isolate import isolate_face
-            from .reconstruct import ReconResult
+            import numpy as np
+            from .face3dgs.appearance import offline_render
+            from .face3dgs.appearance.pipeline import apply_makeup_to_asset
+            from .face3dgs.appearance.render_pbr import render_cloud_pbr
+            from .face3dgs.splat_io import read_ply, write_ply
             proj = self.project
-            result = ReconResult(project_dir=proj, ply_path=proj / "final.ply",
-                                 sparse_dir=proj / "colmap" / "sparse" / "0",
-                                 images_dir=proj / "images", seconds=0.0)
-            # 先裁出脸部点云：final.ply 含背景/肩颈，直接贴合会把妆上到背景上，
-            # 预览也全是漂浮噪点。face.ply 比 final.ply 旧时自动重裁。
-            face_ply = proj / "face.ply"
-            if not face_ply.exists() or \
-                    face_ply.stat().st_mtime < result.ply_path.stat().st_mtime:
-                isolate_face(result, face_ply)
-            fitter = FaceMakeupFitter()
-            fit = fitter.fit(result, self.spec, OUT_DIR / "fitted",
-                             face_ply=face_ply, intensity=self.intensity,
-                             densify=True)
-            self.done.emit(str(fit.ply_path), str(fit.previews[0]) if fit.previews else "")
+            asset = proj / "asset"
+            cloud = read_ply(asset / "base.ply")
+            landmarks = np.load(asset / "landmarks.npy")
+            made, _cov = apply_makeup_to_asset(cloud, landmarks, self.spec, asset,
+                                               intensity=self.intensity)
+            write_ply(made, asset / "madeup.ply")
+            preview = asset / "preview.png"
+            # 高保真预览：gsplat 定妆照（与离线交付同一渲染器）；无 CUDA 回退 numpy
+            try:
+                center, up, front = offline_render.infer_axes(made["xyz"], landmarks)
+                fh = offline_render.face_height(made["xyz"], up, center)
+                cams = offline_render.orbit_synthetic(center, up, front, fh, n=3, size=640)
+                img = cv2.cvtColor(
+                    offline_render.render_pose(offline_render.load_prepared(made, use_sh=False),
+                                               cams[1][0], cams[1][1], size=640),
+                    cv2.COLOR_RGB2BGR)
+            except Exception:
+                from .face3dgs import colmap_io
+                sparse = next((proj / "colmap" / "sparse").glob("[0-9]*"))
+                model = colmap_io.read_sparse(sparse)
+                name = sorted(model.images)[len(model.images) // 2]
+                im = model.images[name]
+                R = colmap_io.quat_to_rotmat(im["qvec"])
+                t = np.asarray(im["tvec"], np.float64)
+                img = render_cloud_pbr(made, R, t, model.camera, w=640, h=640)
+            cv2.imwrite(str(preview), img)
+            self.done.emit(str(asset / "madeup.ply"), str(preview))
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -139,8 +170,8 @@ class Face3DgsTab(QWidget):
 
     STEPS = [
         ("环绕采集", "正对摄像头，缓慢左右转头"),
-        ("重建点云", "从采集视频重建 3D 高斯点云"),
-        ("贴合妆容", "把当前妆容贴到你的 3D 脸"),
+        ("扫描建模", "SfM 位姿 + gsplat 光度训练 → 你的 3DGS 数字资产"),
+        ("贴合妆容", "在资产上渲染当前妆容（换妆秒级）"),
     ]
 
     def __init__(self, get_layers, get_intensity, parent=None):
@@ -149,8 +180,8 @@ class Face3DgsTab(QWidget):
         self.get_intensity = get_intensity    # () -> float
         self.on_published = None              # 贴妆发布成功后的回调（启用查看器按钮）
         self.capture_worker: CaptureWorker | None = None
-        self.recon_worker: ReconWorker | None = None
-        self.fit_worker: FitWorker | None = None
+        self.recon_worker: ModelWorker | None = None
+        self.fit_worker: MakeupWorker | None = None
         self._active_step = -1
         self._build_ui()
         self.build_panel()                    # 先构建，保证引用存在（稍后由主窗口取走）
@@ -189,7 +220,7 @@ class Face3DgsTab(QWidget):
         self.step_dots: list[QLabel] = []
         self.step_status: list[QLabel] = []
         self.buttons: list[QPushButton] = []
-        labels = ["开始采集", "开始重建", "开始贴妆"]
+        labels = ["开始采集", "开始建模", "开始贴妆"]
         for i, (title, desc) in enumerate(self.STEPS):
             row = QHBoxLayout()
             row.setSpacing(12)
@@ -237,13 +268,15 @@ class Face3DgsTab(QWidget):
         return self.panel
 
     @staticmethod
+    @staticmethod
     def _engine_hint() -> str:
-        st = engines.status_all()
-        missing = [n for n, s in st.items() if not s.ok]
-        if not missing:
-            return "重建引擎就绪（FFmpeg / COLMAP / Brush）"
-        return "重建引擎缺失: " + "、".join(missing) + " — 安装 OOOSplat 桌面版（自带全部引擎）" \
-            "后重启，或设置 OOOSPLAT_ENGINE_DIR 指向引擎目录。"
+        try:
+            import torch
+        except ImportError:
+            return "缺少 torch/gsplat：pip install torch gsplat"
+        if torch.cuda.is_available():
+            return "建模引擎就绪（pycolmap SfM + gsplat GPU 训练）"
+        return "未检测到 CUDA GPU：扫描建模需要 NVIDIA 显卡（gsplat 训练）。"
 
     # ---------------- 步骤状态 ----------------
 
@@ -321,15 +354,14 @@ class Face3DgsTab(QWidget):
     # ---------------- 重建 ----------------
 
     def _start_recon(self):
-        st = engines.status_all()
-        missing = [n for n, s in st.items() if not s.ok]
-        if missing:
-            self.engine_hint.setText(self._engine_hint())
+        hint = self._engine_hint()
+        if "就绪" not in hint:
+            self.engine_hint.setText(hint)
             return
         self.btn_rebuild.setEnabled(False)
-        self._set_step(1, "active", "正在重建…")
+        self._set_step(1, "active", "SfM 位姿 + gsplat 训练…")
         self._set_busy(True)
-        self.recon_worker = ReconWorker(str(OUT_DIR / "capture.mp4"), OUT_DIR / "proj")
+        self.recon_worker = ModelWorker(str(OUT_DIR / "capture.mp4"), OUT_DIR / "proj")
         self.recon_worker.stage.connect(self._on_recon_stage)
         self.recon_worker.done.connect(self._on_recon_done)
         self.recon_worker.failed.connect(self._on_failed)
@@ -339,8 +371,8 @@ class Face3DgsTab(QWidget):
         self.bar.setValue(int(frac * 100))
         self._set_step(1, "active", f"[{stage}] {msg[:60]}")
 
-    def _on_recon_done(self, ply: str):
-        self._set_step(1, "done", "重建完成")
+    def _on_recon_done(self, summary: str):
+        self._set_step(1, "done", f"资产就绪（{summary}）")
         self._set_step(2, "active", "等待贴妆")
         self.btn_fit.setEnabled(True)
         self.btn_fit.setProperty("primary", True)
@@ -356,7 +388,7 @@ class Face3DgsTab(QWidget):
         self.btn_fit.setEnabled(False)
         self._set_step(2, "active", "正在贴合…")
         self._set_busy(True, indeterminate=True)
-        self.fit_worker = FitWorker(OUT_DIR / "proj", spec, self.get_intensity())
+        self.fit_worker = MakeupWorker(OUT_DIR / "proj", spec, self.get_intensity())
         self.fit_worker.done.connect(self._on_fit_done)
         self.fit_worker.failed.connect(self._on_failed)
         self.fit_worker.start()

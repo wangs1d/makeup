@@ -8,7 +8,8 @@
         opacity                   透射 logit → sigmoid
         scale_0..2                对数尺度 → exp
         rot_0..3                  四元数 (w x y z)
-    可选 nx ny nz（法线，部分导出器带，忽略）；f_rest_* 高阶球谐忽略。
+        可选 nx ny nz（法线，部分导出器带，忽略）；f_rest_* 高阶球谐存在时读回并
+        随归一化/抽稀/保存贯穿（Unity/WebGL 端 SH 视角色；旧资产无此段则 DC-only）。
 
 归一化：中心平移到原点、按"脸高"估计缩放到 1 世界单位（与 preview_render 的
 FACE_HEIGHT_M 约定一致，溅射 σ/offset 直接沿用米制参数）。脸高取 y 方向 1%~99%
@@ -41,6 +42,7 @@ class AvatarData:
     raw_min: np.ndarray | None = None
     raw_max: np.ndarray | None = None
     meta: dict = field(default_factory=dict)
+    sh_rest: np.ndarray | None = None   # (N,pc,3) SH 高阶（pc≤8；None=DC-only）
 
     @property
     def n(self) -> int:
@@ -55,7 +57,8 @@ class AvatarData:
         idx = np.sort(rng.choice(self.n, max_count, replace=False))
         return AvatarData(self.means[idx], self.scales[idx], self.quats[idx],
                           self.colors[idx], self.opacities[idx],
-                          self.face_height, self.raw_min, self.raw_max, self.meta)
+                          self.face_height, self.raw_min, self.raw_max, self.meta,
+                          None if self.sh_rest is None else self.sh_rest[idx])
 
 
 # ---------------- PLY 解析 ----------------
@@ -118,7 +121,19 @@ def load_avatar(path: str | Path, max_count: int | None = None) -> AvatarData:
     quats = np.stack([col("rot_0"), col("rot_1"), col("rot_2"), col("rot_3")], axis=1)
     quats /= np.linalg.norm(quats, axis=1, keepdims=True) + 1e-9
 
-    av = normalize(AvatarData(means, scales, quats, colors, opacities))
+    # SH 高阶（f_rest_*，3DGS 通道主序）：存在时读回（≤8/通道，Unity 端 degree2 布局）
+    prop_names = {n for n, _ in props}
+    rest_names = sorted((n for n in prop_names if n.startswith("f_rest_")),
+                        key=lambda s: int(s.rsplit("_", 1)[-1]))
+    sh_rest = None
+    if rest_names and len(rest_names) % 3 == 0:
+        pc = min(len(rest_names) // 3, 8)
+        fr = np.stack([rows[f"f_rest_{c * (len(rest_names) // 3) + k}"].astype(np.float32)
+                       for c in range(3) for k in range(pc)], axis=1)
+        sh_rest = fr.reshape(len(rows), 3, pc).transpose(0, 2, 1)
+
+    av = normalize(AvatarData(means, scales, quats, colors, opacities,
+                              sh_rest=sh_rest))
     if max_count is not None:
         av = av.decimated(max_count)
     return av
@@ -140,13 +155,14 @@ def normalize(av: AvatarData) -> AvatarData:
     means = av.means - np.array([cx, cy, 0.0], np.float32)
     means = means / height
     return AvatarData(means.astype(np.float32), av.scales / height, av.quats, av.colors,
-                      av.opacities, height, lo, hi, av.meta)
+                      av.opacities, height, lo, hi, av.meta, av.sh_rest)
 
 
 # ---------------- 写出（测试/调试/编译产物自描述） ----------------
 
 def save_avatar(av: AvatarData, path: str | Path, raw_scale: bool = False) -> None:
-    """写出标准 3DGS PLY。raw_scale=False 时写归一化坐标（默认）。"""
+    """写出标准 3DGS PLY。raw_scale=False 时写归一化坐标（默认）。
+    sh_rest 存在时写出 f_rest_*（通道主序），Unity/WebGL 端 SH 视角色可用。"""
     means, scales = av.means, av.scales
     if raw_scale:
         h = max(av.face_height, 1e-6)
@@ -156,16 +172,23 @@ def save_avatar(av: AvatarData, path: str | Path, raw_scale: bool = False) -> No
     op = np.log(np.clip(av.opacities, 1e-6, 1 - 1e-6) / np.clip(1 - av.opacities, 1e-6, 1)).astype(np.float32)
     sc = np.log(np.clip(scales, 1e-9, None)).astype(np.float32)
 
+    n_rest = 0 if av.sh_rest is None else int(av.sh_rest.shape[1] * 3)
     props: list[tuple[str, str]] = [(n, "float") for n in
-                                    ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2",
-                                     "opacity", "scale_0", "scale_1", "scale_2",
-                                     "rot_0", "rot_1", "rot_2", "rot_3"]]
+                                    ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2"]
+                                    + [f"f_rest_{i}" for i in range(n_rest)]
+                                    + ["opacity", "scale_0", "scale_1", "scale_2",
+                                       "rot_0", "rot_1", "rot_2", "rot_3"]]
     header = ["ply", "format binary_little_endian 1.0",
               f"element vertex {av.n}",
               *[f"property float {n}" for n, _ in props], "end_header", ""]
-    cols = [means[:, 0], means[:, 1], means[:, 2], dc[:, 0], dc[:, 1], dc[:, 2],
-            op, sc[:, 0], sc[:, 1], sc[:, 2],
-            av.quats[:, 0], av.quats[:, 1], av.quats[:, 2], av.quats[:, 3]]
+    cols = [means[:, 0], means[:, 1], means[:, 2], dc[:, 0], dc[:, 1], dc[:, 2]]
+    if av.sh_rest is not None:
+        pc = av.sh_rest.shape[1]
+        for c in range(3):
+            for k in range(pc):
+                cols.append(av.sh_rest[:, k, c].astype(np.float32))
+    cols += [op, sc[:, 0], sc[:, 1], sc[:, 2],
+             av.quats[:, 0], av.quats[:, 1], av.quats[:, 2], av.quats[:, 3]]
     body = np.empty(av.n, dtype=np.dtype([(n, "<f4") for n, _ in props]))
     for (n, _), c in zip(props, cols):
         body[n] = c.astype("<f4")

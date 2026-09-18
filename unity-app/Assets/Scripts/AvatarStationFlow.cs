@@ -94,6 +94,11 @@ namespace MakeupMirror
             avatarRenderer.Load(id, ply);
             AvatarId = id;
             avatarRenderer.transform.localScale = Vector3.one * faceHeightMeters;
+            // PBR 材质 + 主光 sidecar（写实资产管线产出；缺席时保持中性材质）
+            byte[] material = await FetchAsset(msg, "material.bin");
+            if (material != null) avatarRenderer.ApplyMaterial(material);
+            byte[] light = await FetchAsset(msg, "light.bin");
+            if (light != null) avatarRenderer.ApplyLight(light);
             SetState(StationState.Registered);
             ApplyLayout();
         }

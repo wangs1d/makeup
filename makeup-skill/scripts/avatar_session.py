@@ -153,12 +153,22 @@ async def cmd_register(conn: BridgeClient, args) -> None:
     if not conn.asset_base_url:
         fail("bridge 未开启资产侧车（画像体积大，必须走 HTTP 侧车）；"
              "去掉 --asset-port 0 重启 bridge_server")
+    assets = {"avatar.ply": await conn.upload_asset(f"{avatar_id}/avatar.ply", ply_bytes)}
+    # PBR 材质 + 主光 sidecar（写实管线产物与画像同目录时随注册下发；
+    # 缺席则 App 端保持中性材质/默认光）
+    for name in ("material.bin", "light.bin"):
+        p = work / name
+        if p.exists():
+            assets[name] = await conn.upload_asset(f"{avatar_id}/{name}", p.read_bytes())
     payload = {
         "type": "avatar_register", "avatar_id": avatar_id, "meta": meta,
-        "assets_url": {"avatar.ply": await conn.upload_asset(f"{avatar_id}/avatar.ply", ply_bytes)},
+        "assets_url": assets,
     }
     await send(conn, payload, args.to, timeout=60.0)
-    print(f"[avatar] 已注册「{meta['name']}」（{avatar_id}，{meta['count']} 高斯）→ App 加载中 ✓")
+    sidecars = [n for n in ("material.bin", "light.bin") if n in assets]
+    print(f"[avatar] 已注册「{meta['name']}」（{avatar_id}，{meta['count']} 高斯"
+          + (f"，sidecar: {','.join(sidecars)}" if sidecars else "")
+          + f"）→ App 加载中 ✓")
 
 
 async def cmd_preview(conn: BridgeClient, args) -> None:

@@ -345,30 +345,46 @@ class SplatCloudBuilder:
 
     @staticmethod
     def export_ply(cloud: dict, path: str | Path):
-        """3DGS 标准 .ply（f_dc / opacity / scale log / rot wxyz），兼容 SuperSplat 等。"""
+        """3DGS 标准 .ply（f_dc / opacity / scale log / rot wxyz），兼容 SuperSplat 等。
+
+        cloud["sh_rest"] (n, K-1, 3) 存在时写出 f_rest_*（3DGS 通道主序约定：
+        f_rest_{c·pc + (k-1)} = 第 c 通道第 k 个系数），读入端按数量反推 SH 阶数。"""
         xyz = cloud["xyz"].astype(np.float32)
         s = np.log(np.maximum(cloud["scale"], 1e-8)).astype(np.float32)
         rgba = np.clip(cloud["rgba"], 0, 1)
         f_dc = ((rgba[:, :3] - 0.5) / 0.28209479112561376).astype(np.float32)
-        opa = (np.log(rgba[:, 3] / np.sqrt(np.maximum(1 - rgba[:, 3], 1e-6)))).astype(np.float32)
+        # 标准 logit（3DGS PLY 约定；读取端 sigmoid 严格互逆。旧式 log(a/√(1-a))
+        # 往返一次会把高不透明度 splat 系统性压透明 → 脸面渗底色）
+        opa = np.log(rgba[:, 3] / np.clip(1 - rgba[:, 3], 1e-6, None)).astype(np.float32)
         rot = cloud["rot"].astype(np.float32)
         rot = np.stack([rot[:, 3], rot[:, 0], rot[:, 1], rot[:, 2]], axis=1)  # wxyz
+        sh_rest = cloud.get("sh_rest")
         n = len(xyz)
+        n_rest = 0 if sh_rest is None else int(sh_rest.shape[1] * 3)
+        fr = None
+        if sh_rest is not None:
+            pc = sh_rest.shape[1]
+            fr = np.zeros((n, pc * 3), np.float32)
+            for c in range(3):
+                fr[:, c * pc:(c + 1) * pc] = sh_rest[:, :, c]
         header = (
             "ply\nformat binary_little_endian 1.0\n"
             f"element vertex {n}\n"
             "property float x\nproperty float y\nproperty float z\n"
             "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n"
-            "property float opacity\n"
+            + "".join(f"property float f_rest_{i}\n" for i in range(n_rest))
+            + "property float opacity\n"
             "property float scale_0\nproperty float scale_1\nproperty float scale_2\n"
             "property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n"
             "end_header\n")
-        arr = np.zeros(n, dtype=np.dtype([
+        fields = [
             ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
             ("f_dc_0", "<f4"), ("f_dc_1", "<f4"), ("f_dc_2", "<f4"),
+        ] + [(f"f_rest_{i}", "<f4") for i in range(n_rest)] + [
             ("opacity", "<f4"),
             ("scale_0", "<f4"), ("scale_1", "<f4"), ("scale_2", "<f4"),
-            ("rot_0", "<f4"), ("rot_1", "<f4"), ("rot_2", "<f4"), ("rot_3", "<f4")]))
+            ("rot_0", "<f4"), ("rot_1", "<f4"), ("rot_2", "<f4"), ("rot_3", "<f4")]
+        arr = np.zeros(n, dtype=np.dtype(fields))
         arr["x"], arr["y"], arr["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
         for k in range(3):
             arr[f"f_dc_{k}"] = f_dc[:, k]
@@ -376,6 +392,9 @@ class SplatCloudBuilder:
         arr["opacity"] = opa
         for k in range(4):
             arr[f"rot_{k}"] = rot[:, k]
+        if fr is not None:
+            for i in range(n_rest):
+                arr[f"f_rest_{i}"] = fr[:, i]
         with open(path, "wb") as f:
             f.write(header.encode("ascii"))
             f.write(arr.tobytes())

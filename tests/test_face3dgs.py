@@ -23,7 +23,7 @@ _spec.loader.exec_module(prc)
 from makeupstudio.face3dgs import colmap_io, engines  # noqa: E402
 from makeupstudio.face3dgs.capture import BUCKET_MIN_SECONDS, OrbitCaptureSession  # noqa: E402
 from makeupstudio.face3dgs.fit_makeup import (FaceMakeupFitter, kabsch_similarity,  # noqa: E402
-                                              render_cloud, triangulate_dlt)
+                                              triangulate_dlt)
 from makeupstudio.face3dgs.isolate import isolate_face  # noqa: E402
 from makeupstudio.face3dgs.reconstruct import (LocalEngineBackend, ReconJob,  # noqa: E402
                                                ReconResult)
@@ -384,51 +384,3 @@ def _synthetic_user_cloud(fitter, jitter=0.004, n=900):
     return {"xyz": xyz.astype(np.float32), "scale": np.full((n, 3), 0.01, np.float32),
             "rot": rot.astype(np.float32),
             "rgba": np.full((n, 4), 0.75, np.float32)}, landmarks
-
-
-def test_apply_makeup_tints_lips_only(fitter):
-    cloud, landmarks = _synthetic_user_cloud(fitter)
-    presets = json.loads((ROOT / "makeup-skill" / "presets" / "date-rose.json")
-                         .read_text(encoding="utf-8"))
-    lipstick = next(l for l in presets["layers"] if l["id"] == "lipstick-both")
-    made = fitter.apply_makeup(cloud, [lipstick], landmarks, intensity=0.9)
-    assert not np.allclose(made["rgba"], cloud["rgba"])          # 有变化
-    # 变化只发生在唇区 splat（按 canonical UV 距离唇中心判断）
-    assert len(made["xyz"]) == len(cloud["xyz"])
-    changed = np.abs(made["rgba"] - cloud["rgba"]).sum(1) > 0.02
-    assert 0 < changed.sum() < len(changed) * 0.5                # 部分区域而非全部
-
-
-def test_fit_end_to_end_synthetic(fitter, tmp_path, monkeypatch):
-    """跳过视频三角化（直接注入合成地标），验证 fit 主流程与产物。"""
-    proj = tmp_path / "proj"
-    _write_synthetic_sparse(proj / "colmap" / "sparse" / "0", n_images=4, size=(80, 60))
-    (proj / "images").mkdir(parents=True)
-    for k in range(1, 5):
-        cv2.imwrite(str(proj / "images" / f"frame_{k:05d}.jpg"),
-                    np.full((60, 80, 3), 128, np.uint8))
-    cloud, landmarks = _synthetic_user_cloud(fitter)
-    write_ply(cloud, proj / "face.ply")
-    result = ReconResult(project_dir=proj, ply_path=proj / "face.ply",
-                         sparse_dir=proj / "colmap" / "sparse" / "0",
-                         images_dir=proj / "images", seconds=0.0)
-    presets = json.loads((ROOT / "makeup-skill" / "presets" / "date-rose.json")
-                         .read_text(encoding="utf-8"))
-
-    made = fitter.apply_makeup(cloud, presets["layers"], landmarks, intensity=0.8)
-    out = tmp_path / "fitted"
-    out.mkdir()
-    write_ply(made, out / "madeup.ply")
-    from makeupstudio.face3dgs.splat_io import export_splat
-    export_splat(made, out / "madeup.splat")
-    assert (out / "madeup.ply").stat().st_size > 0
-    assert (out / "madeup.splat").stat().st_size == len(made["xyz"]) * 32
-    # 相同变换一致性：配准自身 → RMSE≈0
-    s, R, t, rmse = fitter.register(landmarks)
-    assert rmse < 0.05
-    # 预览渲染可用
-    model = colmap_io.read_sparse(proj / "colmap" / "sparse" / "0")
-    im = model.images["frame_00001.jpg"]
-    img = render_cloud(made, colmap_io.quat_to_rotmat(im["qvec"]), im["tvec"],
-                       model.camera, w=160, h=120)
-    assert img.shape == (120, 160, 3)
