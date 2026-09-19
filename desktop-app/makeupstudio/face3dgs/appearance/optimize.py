@@ -34,11 +34,16 @@ def optimize_appearance(base_cloud: dict[str, np.ndarray],
                         makeup_w: np.ndarray,
                         guidance_views: list[dict],
                         cfg: OptConfig | None = None,
-                        on_progress: ProgressCB | None = None) -> dict[str, np.ndarray]:
+                        bare_cloud: dict[str, np.ndarray] | None = None,
+                        on_progress: ProgressCB | None = None) -> dict:
     """guidance 监督的外观优化。
 
-    base_cloud     训练产物（xyz/scale/rot/rgba）
-    makeup_w       (n,) 每 splat 妆区权重（UV 烘焙产物）
+    base_cloud     优化起点（xyz/scale/rot/rgba）——壳层架构下传合并点云
+                   （素颜底模 + 妆容壳层），颜色残差直接修在壳层 splat 上
+    makeup_w       (n,) 每 splat 妆区权重（与 base_cloud 等长）
+    bare_cloud     identity 锁的素颜参考（缺省用 base_cloud 本身）。壳层
+                   架构必须传素颜底模，否则"素颜目标"就是带妆渲染自身，
+                   锁失效
     guidance_views [{"w2c"(4,4), "K"(3,3), "img"(H,W,3) RGB 0..1,
                       "size"(H,W)}] —— Stable-Makeup 对各视角素颜渲染的输出
     返回新 cloud（rgba 更新；几何原样）。
@@ -47,6 +52,7 @@ def optimize_appearance(base_cloud: dict[str, np.ndarray],
     from gsplat import rasterization
 
     cfg = cfg or OptConfig()
+    bare_ref = base_cloud if bare_cloud is None else bare_cloud
     cb = on_progress or (lambda *a: None)
     rng = np.random.default_rng(cfg.seed)
 
@@ -69,14 +75,21 @@ def optimize_appearance(base_cloud: dict[str, np.ndarray],
     w_col = torch.zeros(1, n, 3, device="cuda")
     w_col[0, :, 0] = T(makeup_w)
 
-    # 每视角素颜渲染（identity 锁目标，冻结）
+    # 每视角素颜渲染（identity 锁目标，冻结）：用素颜参考云自身的几何+颜色
+    bare_means = T(bare_ref["xyz"])
+    bare_quats = T(bare_ref["rot"][:, [3, 0, 1, 2]])
+    bare_scales = T(np.log(np.maximum(bare_ref["scale"], 1e-10)))
+    bare_op = np.clip(bare_ref["rgba"][:, 3], 1e-4, 1 - 1e-4)
+    bare_rgb = np.clip(bare_ref["rgba"][:, :3], 1e-3, 1 - 1e-3)
+    bare_colors = torch.sigmoid(T(np.log(bare_rgb / (1 - bare_rgb))))
     bare_targets, guidance_imgs = [], []
     for gv in guidance_views:
         H, W = gv["size"]
         with torch.no_grad():
             r, _a, _i = rasterization(
-                means, quats / quats.norm(dim=1, keepdim=True), torch.exp(scales),
-                torch.sigmoid(d_op[..., 0]), torch.sigmoid(d_rgb)[None, ...],
+                bare_means, bare_quats / bare_quats.norm(dim=1, keepdim=True),
+                torch.exp(bare_scales), torch.sigmoid(T(bare_op)),
+                bare_colors[None, ...],
                 torch.tensor(gv["w2c"], dtype=torch.float32, device="cuda")[None],
                 torch.tensor(gv["K"], dtype=torch.float32, device="cuda")[None],
                 W, H, packed=False, backgrounds=torch.zeros(1, 3, device="cuda"))
@@ -98,7 +111,7 @@ def optimize_appearance(base_cloud: dict[str, np.ndarray],
         return rasterization(
             means, quats / quats.norm(dim=1, keepdim=True), torch.exp(scales),
             torch.sigmoid(d_op[..., 0]), torch.sigmoid(d_rgb)[None, ...],
-            torch.tensor(view["c2w"], dtype=torch.float32, device="cuda")[None],
+            torch.tensor(view["w2c"], dtype=torch.float32, device="cuda")[None],
             torch.tensor(view["K"], dtype=torch.float32, device="cuda")[None],
             W, H, packed=False, backgrounds=torch.zeros(1, 3, device="cuda"))
 
@@ -112,7 +125,7 @@ def optimize_appearance(base_cloud: dict[str, np.ndarray],
             wmap, _aw, _iw = rasterization(
                 means, quats / quats.norm(dim=1, keepdim=True), torch.exp(scales),
                 torch.ones_like(torch.sigmoid(d_op[..., 0])), w_col,
-                torch.tensor(guidance_views[gi]["c2w"], dtype=torch.float32,
+                torch.tensor(guidance_views[gi]["w2c"], dtype=torch.float32,
                              device="cuda")[None],
                 torch.tensor(guidance_views[gi]["K"], dtype=torch.float32,
                              device="cuda")[None],

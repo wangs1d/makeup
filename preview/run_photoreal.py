@@ -52,6 +52,9 @@ def main() -> int:
     ap.add_argument("--sfm", default=None, help="COLMAP sparse 目录（--video 模式自动生成）")
     ap.add_argument("--init", default=None, help="初始化点云 ply（缺省用 COLMAP 点稠密化）")
     ap.add_argument("--spec", required=True, help="妆容 spec json")
+    ap.add_argument("--reference", default=None,
+                    help="妆效参考图（有则先逐区域标定 spec 颜色/浓度再上妆，"
+                         "并在 report 输出逐区域 ΔE00 还原度）")
     ap.add_argument("--out", required=True, help="输出目录")
     ap.add_argument("--iters", type=int, default=20000)
     ap.add_argument("--max-gs", type=int, default=400_000)
@@ -65,6 +68,13 @@ def main() -> int:
         print("需要 --video（全自动）或 --project+--sfm（已有工程）", file=sys.stderr)
         return 2
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    if args.reference:
+        import cv2
+        from makeupstudio.face3dgs.appearance.calibrate import calibrate_spec
+        from makeupstudio.transfer import imread_unicode
+        spec = calibrate_spec(spec, imread_unicode(args.reference))
+        hit = spec.get("calibration", {}).get("regions", [])
+        print(f"[calibrate] 参考图标定完成：{hit or '（未匹配到妆区）'}")
     cfg = TrainConfig(iters=args.iters, max_gs=args.max_gs)
 
     if args.video:

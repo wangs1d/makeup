@@ -26,7 +26,7 @@ from ...tracker import FaceTracker
 from ..fit_makeup import FaceMakeupFitter
 from . import train_base as tb
 from .frames import FrameSelection, select_frames
-from .makeup_uv import UvMakeupBaker, UvMakeupMaps
+from .makeup_uv import UvMakeupBaker, UvMakeupMaps, merge_makeup_layer
 from .render_pbr import render_cloud_pbr
 from .train_base import TrainConfig, build_views
 from .uvbind import bind_uv
@@ -45,9 +45,12 @@ class PhotorealResult:
     previews: list[Path] = field(default_factory=list)
 
 
-def _triangulate_landmarks(model: colmap_io.SparseModel, sel: FrameSelection) -> np.ndarray:
+def _triangulate_landmarks(model: colmap_io.SparseModel, sel: FrameSelection,
+                           px_scale: float = 1.0) -> np.ndarray:
     """复用选帧阶段的地标观测做 DLT 三角化（468,3），免去二次 MediaPipe 检测。
 
+    px_scale：sel.px 像素空间 -> 相机原生像素空间（SR/超分帧是放大图，观测
+    坐标比 COLMAP 内参大 N 倍，不缩放三角化结果会整体飞出 N 倍远）。
     与 fit_makeup.triangulate_landmarks 同款鲁棒性：cheirality 过半校验 +
     中位数距离飞点剔除。"""
     from ..fit_makeup import N_CANON_VERTS, projection_matrix, triangulate_dlt
@@ -60,7 +63,7 @@ def _triangulate_landmarks(model: colmap_io.SparseModel, sel: FrameSelection) ->
         if im["cam_id"] != cam.cam_id:
             continue
         P = projection_matrix(cam, im["qvec"], im["tvec"])
-        px = sel.px[name][:N_CANON_VERTS]
+        px = sel.px[name][:N_CANON_VERTS] * px_scale
         for li in range(N_CANON_VERTS):
             obs.setdefault(li, []).append((P, px[li]))
 
@@ -152,6 +155,10 @@ def build_asset(project_dir: str | Path, sfm_dir: str | Path,
                             min_frames=12, progress=lambda f, m: cb("frames", f, m))
     finally:
         tracker.close()
+    # 观测像素空间 -> 相机原生空间（SR/放大帧的 sel.px 比内参大 N 倍）
+    first_img = next(images_dir / n for n in sel.names if (images_dir / n).exists())
+    frame_w = cv2.imread(str(first_img)).shape[1]
+    px_scale = model.camera.width / frame_w
     cb("frames", 1.0, f"表情簇 {len(sel)} 帧 / 参考帧 {sel.ref} "
                       f"(落选 {len(sel.rejected)})")
 
@@ -170,7 +177,7 @@ def build_asset(project_dir: str | Path, sfm_dir: str | Path,
 
     # ---- 3. 地标三角化 ----
     cb("bind", 0.2, "三角化 468 地标…")
-    landmarks = _triangulate_landmarks(model, sel)
+    landmarks = _triangulate_landmarks(model, sel, px_scale=px_scale)
     np.save(out_dir / "landmarks.npy", landmarks)
     return cloud, sel, landmarks, model, train_report
 
@@ -178,10 +185,22 @@ def build_asset(project_dir: str | Path, sfm_dir: str | Path,
 def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
                           out_dir: str | Path, tex: int = 2048,
                           intensity: float = 0.8,
+                          guidance: list[dict] | None = None,
+                          as_layer: bool = True,
                           progress: ProgressCB | None = None) -> dict:
-    """在 3DGS 资产上渲染妆容：UV 绑定 → 目标场合成 → 3D 唇锚定 → 烘焙导出。
+    """在 3DGS 资产上渲染妆容：UV 绑定 → 目标场合成 → 3D 锚定 → 烘焙导出。
 
-    产品链路第 3 步（换妆只重跑本步，秒级）。返回 madeup cloud。"""
+    产品链路第 3 步（换妆只重跑本步，秒级）。返回 (madeup cloud, 妆区覆盖)。
+    as_layer=True（默认）：妆容是**真实高斯壳层**——每个妆区底模 splat 生成
+    一个重叠新高斯（对应位置表面上的薄层：沿外法线偏移 0.15×min_scale、
+    妆色×底模真实纹理、finish 材质、opacity=w×底模、sh_rest 置零），底模
+    本身保持素颜；合并点云导出 madeup.ply/.splat。妆在几何上存在，不依赖
+    底模 splat 的颜色被改写。as_layer=False 退回原位 Lab 重染色（诊断用）。
+    3D 锚定区域：唇（lip_band_3d）+ 眼线/睫毛/眉（landmark_band_3d）——
+    canonical 模板在这些高频区域有 ~2% 系统错位，观测地标带优先、UV 蒙版兜底。
+    guidance：_render_guidance_views 产物存在时，先聚合进 UV albedo
+    （bake_guidance）重建壳层，再走 optimize_appearance 图像空间外观精修
+    （identity 锁以素颜底模为参考）。"""
     cb = progress or (lambda *a: None)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -192,20 +211,152 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
     cb("makeup", 0.2, "UV 妆容目标场合成…")
     baker = UvMakeupBaker(tex=tex)
     maps = baker.bake(spec.get("layers", []), intensity=intensity)
-    cb("makeup", 0.6, "唇妆 3D 锚定 + 烘焙回 splat…")
+
+    cb("makeup", 0.5, "3D 地标锚定（唇/眼线/睫毛/眉）…")
+    layers = [l for l in spec.get("layers", []) if l.get("enabled", True)]
     lip3d = None
-    if any(l.get("region") == "lipstick" and l.get("enabled", True)
-           for l in spec.get("layers", [])):
+    bands3d: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if any(l.get("region") == "lipstick" for l in layers):
         try:
             lip3d = baker.lip_band_3d(cloud, landmarks)
-            cb("makeup", 0.7, f"3D 唇带 splats={int((lip3d[0] > 0.02).sum())}")
+            cb("makeup", 0.55, f"3D 唇带 splats={int((lip3d[0] > 0.02).sum())}")
         except RuntimeError as e:
-            cb("makeup", 0.7, f"3D 唇带失败（回退 UV 兜底）：{e}")
-    made = baker.apply_to_cloud(cloud, maps, binding.uv, binding.valid,
-                                lip3d=lip3d, intensity=intensity)
+            cb("makeup", 0.55, f"3D 唇带失败（回退 UV 兜底）：{e}")
+    for l in layers:
+        region = l.get("region")
+        if region not in ("eyeliner", "lashes", "eyebrow"):
+            continue
+        try:
+            bw, bc = baker.landmark_band_3d(
+                cloud, landmarks, region, l.get("shape") or {},
+                strength=float(l.get("opacity", 0.7)) * intensity * 1.3)
+            if float(np.max(bw)) > 0.02:
+                bands3d[region] = (bw, bc)
+                cb("makeup", 0.6, f"3D {region} splats={int((bw > 0.02).sum())}")
+        except (RuntimeError, ValueError) as e:
+            cb("makeup", 0.6, f"3D {region} 失败（回退 UV 模板）：{e}")
+
+    def _bake_to_made(m: UvMakeupMaps) -> dict:
+        if as_layer:
+            layer, src_idx = baker.build_makeup_layer(
+                cloud, m, binding.uv, binding.valid,
+                lip3d=lip3d, near=binding.near, bands3d=bands3d or None)
+            made_m = merge_makeup_layer(cloud, layer, src_idx)
+            if len(src_idx):
+                # 薄层自检：壳层 splat 必须落在对应底模 splat 的足迹内
+                # （偏移 ≤ 0.3×min_scale；0 = 纯重叠，默认含薄层厚度）
+                base_xyz = np.asarray(cloud["xyz"], np.float32)
+                off = np.linalg.norm(made_m["xyz"][len(cloud["xyz"]):]
+                                     - base_xyz[src_idx], axis=1)
+                thin = np.asarray(cloud["scale"], np.float64)[src_idx].min(axis=1)
+                ratio = off / np.maximum(thin, 1e-12)
+                flag = "✓" if float(ratio.max()) <= 0.3 + 1e-6 else "✗ 超限"
+                cb("makeup", 0.7, f"妆容壳层 splats={len(src_idx)} "
+                                  f"薄层偏移 mean={float(ratio.mean()):.2f}"
+                                  f"/max={float(ratio.max()):.2f}×min_scale {flag}")
+            else:
+                cb("makeup", 0.7, "妆容壳层为空（妆权重低于门限）")
+            return made_m
+        return baker.apply_to_cloud(cloud, m, binding.uv, binding.valid,
+                                    lip3d=lip3d, intensity=intensity,
+                                    near=binding.near, bands3d=bands3d or None)
+
+    cb("makeup", 0.65, "生成妆容壳层（near 软门控 + pigment-safe Lab 迁移）…")
+    made = _bake_to_made(maps)
+
+    # ---- guidance 聚合 + 外观精修（可选：spec.guidance 存在且已生成） ----
+    if guidance:
+        cb("makeup", 0.7, "guidance 聚合进 UV albedo…")
+        try:
+            s, R, t, _ = baker.fitter.register(landmarks)
+            S_xyz, S_uv = baker.fitter._surface_samples(s, R, t)
+            views_uv = [{"R": v["R"], "t": v["t"], "cam": v["cam"],
+                         "img": v["img_bgr"]} for v in guidance]
+            maps = baker.bake_guidance(maps, views_uv, (S_xyz, S_uv))
+            made = _bake_to_made(maps)
+        except Exception as e:                   # guidance 聚合失败不阻断主链路
+            cb("makeup", 0.75, f"guidance 聚合失败（跳过）：{e}")
+        try:
+            from .optimize import OptConfig, optimize_appearance
+            cb("makeup", 0.8, "外观精修（几何冻结，颜色残差求解）…")
+            opt_views = [{"w2c": v["w2c"], "K": v["K"], "img": v["img"],
+                          "size": v["size"]} for v in guidance]
+            made = optimize_appearance(
+                made, made["makeup_w"], opt_views, bare_cloud=cloud,
+                cfg=OptConfig(iters=int((spec.get("guidance") or {})
+                                        .get("iters", 1500))))
+        except (ImportError, RuntimeError) as e:  # CUDA/torch 缺失时不阻断
+            cb("makeup", 0.9, f"外观精修跳过（{e}）")
+
     _save_uv_debug(maps, out_dir / "makeup_uv_debug.png")
-    cb("makeup", 1.0, f"妆区覆盖 {float((maps.w > 0.05).mean()):.3f}")
-    return made, float((maps.w > 0.05).mean())
+    cov_mask = maps.w > 0.05
+    if maps.lip_w is not None:                     # 唇妆独立通道计入覆盖
+        cov_mask = cov_mask | (maps.lip_w > 0.05)
+    coverage = float(cov_mask.mean())
+    cb("makeup", 1.0, f"妆区覆盖 {coverage:.3f}")
+    return made, coverage
+
+
+def _render_guidance_views(cloud: dict, model: colmap_io.SparseModel,
+                           sel: FrameSelection, out_dir: Path, spec: dict,
+                           cb: ProgressCB) -> list[dict] | None:
+    """素颜多视角渲染 × Stable-Makeup → 多视角 guidance 图。
+
+    spec.guidance：{"reference": 妆效参考图路径, "views": 视角数(默认5),
+    "size": 渲染分辨率(默认512), "iters": optimize 迭代}。环境不完整时返回
+    None 并给出可执行提示（主链路不阻断）。"""
+    from .. import guidance as gd
+    from .offline_render import load_prepared, render_pose
+
+    gcfg = spec.get("guidance") or {}
+    ref_path = Path(gcfg.get("reference", ""))
+    if not ref_path.is_file():
+        cb("guidance", 1.0, "guidance.reference 缺失，跳过 guidance 链路")
+        return None
+    ok, hint = (gd.status().ok, gd.status().missing_hint)
+    if not ok:
+        cb("guidance", 1.0, f"Stable-Makeup 未就绪，跳过：{hint}")
+        return None
+    import torch
+    if not torch.cuda.is_available():
+        cb("guidance", 1.0, "无 CUDA，跳过 guidance 链路")
+        return None
+
+    names = [n for n in sel.names if n in model.images]
+    k = max(1, int(gcfg.get("views", 5)))
+    picks = [names[int(i)] for i in np.linspace(0, len(names) - 1, min(k, len(names)))]
+    gdir = out_dir / "guidance"
+    gdir.mkdir(parents=True, exist_ok=True)
+    size = int(gcfg.get("size", 512))
+    prepared = load_prepared(cloud, use_sh=True)
+    cam = model.camera
+    K = np.array([[cam.params[0], 0, cam.params[1]],
+                  [0, cam.params[0], cam.params[2]],
+                  [0, 0, 1]], np.float64)
+    views: list[dict] = []
+    for i, name in enumerate(picks):
+        im = model.images[name]
+        R = colmap_io.quat_to_rotmat(im["qvec"])
+        t = np.asarray(im["tvec"], np.float64)
+        w2c = np.eye(4)
+        w2c[:3, :3] = R
+        w2c[:3, 3] = t
+        bare = render_pose(prepared, w2c, K, size=size, ssaa=1, denoise=False)
+        bare_png = gdir / f"bare_{i}.png"
+        cv2.imwrite(str(bare_png), cv2.cvtColor(bare, cv2.COLOR_RGB2BGR))
+        out_png = gdir / f"guidance_{i}.png"
+        gd.generate(bare_png, ref_path, out_png)
+        g_bgr = cv2.imread(str(out_png))
+        if g_bgr is None:
+            cb("guidance", (i + 1) / len(picks), f"guidance {i} 读取失败，跳过")
+            continue
+        views.append({"w2c": w2c, "K": K, "R": R, "t": t, "cam": cam,
+                      "img_bgr": g_bgr,
+                      "img": cv2.cvtColor(g_bgr, cv2.COLOR_BGR2RGB
+                                          ).astype(np.float32) / 255.0,
+                      "size": (size, size)})
+        cb("guidance", (i + 1) / len(picks), f"guidance {i + 1}/{len(picks)}")
+    return views or None
 
 
 def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
@@ -224,11 +375,17 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
         reuse_base=reuse_base, progress=progress)
     cb("bind", 1.0, "资产就绪")
 
+    # ---- guidance（可选）：spec.guidance.reference 存在且 Stable-Makeup 就绪 ----
+    guidance = None
+    if spec.get("guidance"):
+        cb("guidance", 0.0, "素颜多视角渲染 × Stable-Makeup…")
+        guidance = _render_guidance_views(cloud, model, sel, out_dir, spec, cb)
+
     made, coverage = apply_makeup_to_asset(
         cloud, landmarks, spec, out_dir, tex=tex,
-        intensity=intensity, progress=progress)
+        intensity=intensity, guidance=guidance, progress=progress)
 
-    # ---- 预览（PBR） ----
+    # ---- 预览（PBR + 妆感材质） ----
     cb("export", 0.2, "素颜|妆后对比渲染…")
     images_dir = (project_dir / "capture" / "frames"
                   if (project_dir / "capture" / "frames").exists()
@@ -239,7 +396,13 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
         d_w, s_w, t_w = tb.estimate_light_dir(build_views(model, sel, images_dir,
                                                           train_cfg or TrainConfig()))
         tb.write_light_bin(out_dir / "light.bin", d_w, s_w, t_w)
-    previews = _render_previews(model, sel, cloud, made, images_dir, out_dir)
+    previews, madeup_renders = _render_previews(model, sel, cloud, made,
+                                                images_dir, out_dir)
+
+    # ---- 还原度度量：渲染帧妆区 vs spec 目标色的逐区域 ΔE00 ----
+    delta_e = _delta_e_report(spec, sel, madeup_renders, images_dir)
+    cb("export", 0.5, "还原度 ΔE00 " + (str(delta_e.get("_mean", "n/a"))
+                                        if delta_e else "（无妆区可评）"))
 
     # ---- 导出 ----
     from ..splat_io import export_splat, write_ply
@@ -250,9 +413,12 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
         "frames_selected": len(sel.names), "frames_rejected": len(sel.rejected),
         "ref_frame": sel.ref, "train": train_report,
         "splats": int(len(made["xyz"])),
+        "makeup_layer_splats": int((np.asarray(made["makeup_w"]) > 0.02).sum()),
         "uv_tex": tex, "makeup_coverage": round(coverage, 4),
         "layers": [l.get("id", l.get("region")) for l in spec.get("layers", [])
                    if l.get("enabled", True)],
+        "guidance": bool(guidance),
+        "makeup_delta_e": delta_e,
         "seconds": round(time.time() - t0, 1),
     }
     (out_dir / "report.json").write_text(json.dumps(
@@ -261,6 +427,43 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
     return PhotorealResult(project_dir=project_dir, base_cloud=cloud,
                            made_cloud=made, maps=None, selection=sel,
                            train_report=train_report, previews=previews)
+
+
+def _delta_e_report(spec: dict, sel: FrameSelection,
+                    madeup_renders: dict[str, np.ndarray],
+                    images_dir: Path) -> dict:
+    """逐帧妆区 ΔE00（渲染帧 vs spec 目标色）→ 逐区域均值 + 总均值。
+
+    蒙版由该帧 MediaPipe 观测地标（sel.px）栅格化，与渲染帧同分辨率——
+    与烘焙用同一套区域语义，度量的是"交付图里的妆色离 spec 目标多远"。"""
+    from .calibrate import image_region_masks, region_delta_e, spec_targets
+
+    targets = spec_targets(spec)
+    if not targets or not madeup_renders:
+        return {}
+    acc: dict[str, list[float]] = {}
+    for name, img_m in madeup_renders.items():
+        px = getattr(sel, "px", {}).get(name)
+        if px is None:
+            continue
+        ref = cv2.imread(str(images_dir / name))
+        if ref is None:
+            continue
+        h, w = ref.shape[:2]
+        size = img_m.shape[0]
+        px_s = px.copy()
+        px_s[:, 0] *= size / w
+        px_s[:, 1] *= size / h
+        masks = image_region_masks(px_s, size, size,
+                                   regions=tuple(targets.keys()))
+        per = region_delta_e(img_m[..., ::-1], masks, targets)
+        for rgn, v in per.items():
+            acc.setdefault(rgn, []).append(v)
+    if not acc:
+        return {}
+    out = {r: round(float(np.mean(v)), 2) for r, v in acc.items()}
+    out["_mean"] = round(float(np.mean(list(out.values()))), 2)
+    return out
 
 
 def _save_uv_debug(maps: UvMakeupMaps, path: Path) -> None:
@@ -275,15 +478,22 @@ def _save_uv_debug(maps: UvMakeupMaps, path: Path) -> None:
 
 def _render_previews(model: colmap_io.SparseModel, sel: FrameSelection,
                      bare: dict, made: dict, images_dir: Path,
-                     out_dir: Path) -> list[Path]:
-    """素颜|妆后对比图：真实帧 | gsplat 渲染（训练同款光栅化器，高保真），
-    无 CUDA 时回退 numpy 圆核预览（仅诊断用）。"""
+                     out_dir: Path) -> tuple[list[Path], dict[str, np.ndarray]]:
+    """素颜|妆后对比图：真实帧 | gsplat 渲染（训练同款光栅化器 + 妆感材质
+    合成），无 CUDA 时回退 numpy 圆核预览（仅诊断用）。
+
+    返回（对比图路径列表, {帧名: 妆后渲染 BGR}）——后者供 ΔE00 还原度评测。"""
+    from .offline_render import build_shade
     from .render_pbr import render_cloud_pbr
     names = [n for n in sel.names if n in model.images]
     picks = [names[0], names[len(names) // 2], names[-1]]
-    size = (460, 460)
+    size = 760                       # 460 看不见唇纹/粉感，验收环节提高分辨率
 
-    def gsplat_at(cloud: dict, name: str) -> np.ndarray | None:
+    shade_made = build_shade(made, mat_dir=out_dir)
+    shade_bare = build_shade(bare, mat_dir=out_dir)
+
+    def gsplat_at(cloud: dict, name: str,
+                  shade: "object | None" = None) -> np.ndarray | None:
         try:
             import torch
             if not torch.cuda.is_available():
@@ -299,29 +509,34 @@ def _render_previews(model: colmap_io.SparseModel, sel: FrameSelection,
             K = np.array([[cam.params[0], 0, cam.params[1]],
                           [0, cam.params[0], cam.params[2]],
                           [0, 0, 1]], np.float64)
-            img = render_pose(load_prepared(cloud), w2c, K, size=size[0], ssaa=1)
+            img = render_pose(load_prepared(cloud), w2c, K, size=size, ssaa=1,
+                              shade=shade)
             return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         except Exception:
             return None
 
-    outs = []
+    outs, renders = [], {}
     for i, name in enumerate(picks):
-        im = model.images[name]
-        R = colmap_io.quat_to_rotmat(im["qvec"])
-        t = np.asarray(im["tvec"], np.float64)
-        img_m = gsplat_at(made, name)
+        img_m = gsplat_at(made, name, shade_made)
         if img_m is None:
-            img_m = render_cloud_pbr(made, R, t, model.camera, w=size[0], h=size[1])
-        img_b = gsplat_at(bare, name)
+            im = model.images[name]
+            img_m = render_cloud_pbr(
+                made, colmap_io.quat_to_rotmat(im["qvec"]),
+                np.asarray(im["tvec"], np.float64), model.camera, w=size, h=size)
+        img_b = gsplat_at(bare, name, shade_bare)
         if img_b is None:
-            img_b = render_cloud_pbr(bare, R, t, model.camera, w=size[0], h=size[1])
+            im = model.images[name]
+            img_b = render_cloud_pbr(
+                bare, colmap_io.quat_to_rotmat(im["qvec"]),
+                np.asarray(im["tvec"], np.float64), model.camera, w=size, h=size)
+        renders[name] = img_m
         ref = cv2.imread(str(images_dir / name))
         if ref is not None:
-            ref = cv2.resize(ref, size)
+            ref = cv2.resize(ref, (size, size))
             row = np.concatenate([ref, img_b, img_m], axis=1)
         else:
             row = np.concatenate([img_b, img_m], axis=1)
         p = out_dir / f"compare_{i}.png"
         cv2.imwrite(str(p), row)
         outs.append(p)
-    return outs
+    return outs, renders
