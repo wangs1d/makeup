@@ -92,6 +92,21 @@ def _cmd_makeup(args) -> int:
     return 0
 
 
+def _cmd_pack_bake(args) -> int:
+    """妆容 spec → canonical UV 图集 pack（跨用户可移植，④）。"""
+    import json
+    from .appearance.makeup_pack import bake_preset_pack
+    spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    pack = bake_preset_pack(spec, tex=args.tex, intensity=args.intensity)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pack.save(out)
+    print(f"preset pack 已烘焙：{out}（tex={pack.tex}，无用户绑定）\n"
+          f"跨用户应用：bind_uv(用户云) → pack.with_binding(uv, valid) → "
+          f"apply_pack_to_cloud / 像素渲染")
+    return 0
+
+
 def _cmd_render(args) -> int:
     """已有资产 → 后台高保真渲染交付物（定妆照 + 环绕视频 + 素颜对比，无 Unity）。"""
     from pathlib import Path as _Path
@@ -143,10 +158,17 @@ def _cmd_render(args) -> int:
 
     def cb(f, m):
         print(f"\r[{f*100:5.1f}%] {m:<46}", end="", flush=True)
+    denoise = {"auto": None, "on": True, "off": False}[args.denoise]
     print(f"离线渲染：{ply} → {out}{'（真实位姿环绕+SH）' if args.sfm else '（DC-only 窄幅环绕）'}")
     outs = deliver(ply, out, base_ply=base_ply, landmarks_path=landmarks,
                    sfm_dir=_Path(args.sfm) if args.sfm else None,
-                   n_frames=args.frames, size=args.size, progress=cb)
+                   n_frames=args.frames, size=args.size, ssaa=args.ssaa,
+                   denoise=denoise, background=args.background, light=args.light,
+                   force=args.force,
+                   pixel_makeup={"auto": None, "on": True,
+                                 "off": False}[args.pixel_makeup],
+                   composite_mode=args.composite,
+                   sigma=args.sigma, skip_video=args.no_video, progress=cb)
     print()
     for k, v in outs.items():
         print(f"  {k}: {v if isinstance(v, str) else (', '.join(v) if isinstance(v, list) else v)}")
@@ -187,8 +209,35 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sfm", help="COLMAP sparse 目录（给定时走真实位姿环绕+SH，推荐）")
     p.add_argument("-o", "--out", help="输出目录（缺省 project/asset/renders）")
     p.add_argument("--frames", type=int, default=36, help="环绕帧数（默认 36）")
-    p.add_argument("--size", type=int, default=1024, help="输出边长（默认 1024）")
+    p.add_argument("--size", type=int, default=1024,
+                   help="输出边长（默认 1024；1080 交付档用 --size 1080 --ssaa 2）")
+    p.add_argument("--ssaa", type=int, default=3, help="超采样倍数（默认 3）")
+    p.add_argument("--background", default="white",
+                   help="背景：white/studio/warm/cold/transparent（默认 white）")
+    p.add_argument("--light", default="capture",
+                   help="环境光：capture（采集光）/studio/warm/cold/beauty")
+    p.add_argument("--denoise", default="auto", choices=["auto", "on", "off"],
+                   help="泼溅颗粒滤波：auto=按质量分级（A 关其余开）")
+    p.add_argument("--force", action="store_true",
+                   help="越过质量门禁（C 级资产仅诊断用途）")
+    p.add_argument("--pixel-makeup", default="auto", choices=["auto", "on", "off"],
+                   help="逐像素妆容合成（2048² pack 采样 + Beer-Lambert）："
+                        "auto=存在 makeup_maps.npz 即启用")
+    p.add_argument("--composite", default="beer", choices=["beer", "linear"],
+                   help="妆层合成模型：beer=颜料吸收（默认）/ linear=旧壳层线性 alpha")
+    p.add_argument("--sigma", type=float, default=None,
+                   help="Beer-Lambert 吸收系数（默认用 pack 内置 2.0）")
+    p.add_argument("--no-video", action="store_true",
+                   help="跳过环绕视频（只出定妆照/对比图）")
     p.set_defaults(func=_cmd_render)
+
+    p = sub.add_parser("pack-bake", help="妆容 spec → canonical UV 图集 pack"
+                                         "（跨用户可移植）")
+    p.add_argument("--spec", required=True, help="妆容 spec json")
+    p.add_argument("-o", "--out", required=True, help="输出 .pack.npz 路径")
+    p.add_argument("--tex", type=int, default=2048)
+    p.add_argument("--intensity", type=float, default=1.0)
+    p.set_defaults(func=_cmd_pack_bake)
 
     args = ap.parse_args(argv)
     return args.func(args)

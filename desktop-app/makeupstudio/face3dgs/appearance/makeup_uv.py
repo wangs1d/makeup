@@ -93,20 +93,22 @@ def lab_adapt(cur_L: np.ndarray, tgt_L: np.ndarray) -> np.ndarray:
                                        - np.asarray(cur_L, np.float64)) / 100.0,
                    0.40, 1.0)
 
-# 写实底模专用的 Lab 迁移系数（底模自带真实光影，系数整体比 fit_makeup 的
-# 模板路径保守；底妆只"匀肤"，不提亮——全脸提亮=刷墙）。
-# 烘焙时叠加 pigment-safe 自适应（见 _apply_locked）：kL 按底色/妆色明度差
-# 收缩 + 色度保底不低于素颜，跨肤色还原一致。
+# 写实底模专用的 Lab 迁移系数（底模自带真实光影；底妆只"匀肤"不提亮——
+# 全脸提亮=刷墙）。烘焙时叠加 pigment-safe 自适应（见 _apply_locked）：kL 按
+# 底色/妆色明度差收缩 + 色度保底不低于素颜，跨肤色还原一致。
+# 2026-09-19 重标定（像素路径实测）：眼影/眼线/眉/唇的 kL 过保守会让浓妆
+# 发灰发浑（明度不跟随=黑妆涂不出黑），序列合成后各层独立迁移，系数上调；
+# 唇 chroma 1.30 过冲退役（线性 alpha 时代的补偿，Beer-Lambert 不再需要）。
 PHOTOREAL_LAB = {
     "foundation": (0.08, 0.35),
     "concealer": (0.12, 0.40),
-    "contour": (0.30, 0.55),
+    "contour": (0.42, 0.55),
     "blush": (0.10, 1.45),
-    "eyeshadow": (0.18, 1.30),
-    "eyebrow": (0.55, 0.80),
-    "eyeliner": (0.55, 0.80),
-    "lashes": (0.55, 0.80),
-    "lipstick": (0.60, 1.30),
+    "eyeshadow": (0.40, 1.30),
+    "eyebrow": (0.70, 0.80),
+    "eyeliner": (0.75, 0.80),
+    "lashes": (0.75, 0.80),
+    "lipstick": (0.78, 1.15),
     "highlight": (0.15, 0.20),
 }
 
@@ -116,7 +118,10 @@ class UvMakeupMaps:
     """UV 空间妆容目标场。albedo 是"妆后目标色"，w 是覆盖（0=素颜）。
 
     kL/chroma 逐 texel Lab 迁移系数（按烘焙区域写入）——明度只部分跟随、
-    色度推向妆色，皮肤纹理与原生光影保留。"""
+    色度推向妆色，皮肤纹理与原生光影保留。
+    layer_fields：逐层未融合字段（region/w/tgt/kL/chroma，spec 顺序=上妆
+    顺序）——像素渲染的序列合成（底妆→腮红→高光…逐层迁移叠加）消费；
+    融合字段（w/albedo）保留给壳层路径。"""
     tex: int
     albedo: np.ndarray              # (t,t,3) float 0..1
     w: np.ndarray                   # (t,t) float 0..1（非唇区域）
@@ -129,6 +134,7 @@ class UvMakeupMaps:
     lip_stops: list | None = None       # 唇色带（3D 路径 ramp 用）
     lip_opacity: float = 0.85
     lip_finish: str = "gloss"
+    layer_fields: list = field(default_factory=list)   # 逐层字段（序列合成用）
 
     @staticmethod
     def empty(tex: int = 2048) -> "UvMakeupMaps":
@@ -341,6 +347,13 @@ class UvMakeupBaker:
                     kL_t, chroma_t = PHOTOREAL_LAB.get(region, (0.25, 1.0))
                     maps.kL[upd] = kL_t
                     maps.chroma[upd] = chroma_t
+                    # 逐层字段（序列合成用）：真实上妆是"底妆先改肤色，腮红
+                    # 再叠加在其上"——"w 大者胜"的单层融合会把腮红/修容/高光
+                    # 整体压没（底妆 w 恒大于特征层），像素渲染端按层链合成
+                    maps.layer_fields.append({
+                        "region": region, "w": w[..., 0].copy(),
+                        "tgt": tgt.copy(), "kL": float(kL_t),
+                        "chroma": float(chroma_t)})
                     # 微观粗糙度：粉状加橘皮（唇釉材质由 3D 路径在 apply 时覆盖）
                     ch = maps.channels
                     ch["rough"][upd] = (rough_t + (micro[upd] - 0.5)
@@ -415,6 +428,24 @@ class UvMakeupBaker:
         cloud2["uv"] = np.zeros((len(cloud["xyz"]), 2))   # 触发 _world_lip_mesh 地标路径
         w, cent = fitter._lip_band_weight(cloud2, landmarks, s, R, t)
         return w, cent
+
+    def uv_lip_coverage(self, maps: "UvMakeupMaps", uv: np.ndarray,
+                        valid: np.ndarray) -> int:
+        """UV 唇带（兜底路径）可覆盖的有效 splat 数——3D 唇带覆盖下限参照。
+
+        三角化地标不可靠时 3D 唇带会稀疏到几乎没画上（实测 524 个 vs UV
+        兜底数千），低于下限必须回退 UV 兜底而非当作"成功"（F 升级已补
+        UV 兜底的真实目标场）。"""
+        if maps.lip_w is None:
+            return 0
+        t = maps.tex
+        tx = np.clip(np.asarray(uv[:, 0], np.float64) * (t - 1),
+                     0, t - 1.001).astype(int)
+        ty = np.clip((1 - np.asarray(uv[:, 1], np.float64)) * (t - 1),
+                     0, t - 1.001).astype(int)
+        vals = maps.lip_w[ty, tx].copy()
+        vals[~np.asarray(valid, bool)] = 0.0
+        return int((vals > 0.05).sum())
 
     # ---------- 眼线/睫毛/眉 3D 地标锚定 ----------
 
@@ -588,16 +619,21 @@ class UvMakeupBaker:
         w = smp(maps.w).astype(np.float32)
         w[~valid] = 0.0
         # near 软门控：对全部妆权重生效（含唇兜底与 3D 锚定带）——离 canonical
-        # 表面远的 splat（UV 归属误差/头发/背景）不因任何路径漏涂
+        # 表面远的 splat（UV 归属误差/头发/背景）不因任何路径漏涂。
+        # σ=3.0·med（2026-09-19 重标定）：1.8·med 会把皱褶内 splat（唇是
+        # 重灾区，near≈2-3×med）的妆整体压灭——嘴部出现无妆黑洞；头发/背景
+        # 本就被 valid 位排除，门控只需压制"valid 但略离群"的边界噪声。
         gate = np.ones(len(w), np.float32)
+        gate_anch = np.ones(len(w), np.float32)   # 3D 锚定带专用（观测地标背书）
         if near is not None:
             nv = np.asarray(near, np.float64)[valid]
             if len(nv) and float(np.median(nv)) > 1e-9:
                 med = float(np.median(nv))
-                gate = np.exp(-0.5 * np.maximum(
-                    np.asarray(near, np.float64) - med, 0.0) ** 2
-                    / (1.8 * med) ** 2).astype(np.float32)
+                d = np.maximum(np.asarray(near, np.float64) - med, 0.0)
+                gate = np.exp(-0.5 * d ** 2 / (3.0 * med) ** 2).astype(np.float32)
+                gate_anch = np.exp(-0.5 * d ** 2 / (3.5 * med) ** 2).astype(np.float32)
                 gate[~valid] = 0.0
+                gate_anch[~valid] = 0.0
                 w = w * gate
         tgt = np.stack([core._bilinear(maps.albedo[..., k][..., None], tx, ty)[..., 0]
                         for k in range(3)], axis=1)
@@ -613,9 +649,13 @@ class UvMakeupBaker:
                           + tgt * (1.0 - w_micro), 0, 1)
 
         # ---- 眼线/睫毛/眉：3D 地标锚定带（带只改权重，颜色仍取 UV 场） ----
+        # 一致性校验：锚定 splat 的 uv 必须落在该区域的 UV 模板带内（w>0.02）。
+        # 眉/发际线区 valid 稀疏、绑定噪声大——无校验时锚定权重散点进图集
+        # 会在渲染中显成横穿脸颊/太阳穴的"彩色河流"伪影（实测）。
         if bands3d:
             for _region, (bw, _bc) in bands3d.items():
-                bw = np.asarray(bw, np.float32) * gate
+                bw = np.asarray(bw, np.float32) * gate_anch \
+                    * (w > 0.02).astype(np.float32)
                 bw[~valid] = 0.0
                 w = np.maximum(w, bw)
 
@@ -628,12 +668,12 @@ class UvMakeupBaker:
                                                          FINISH_TARGET["gloss"])
             if lip3d is not None and float(np.max(lip3d[0])) > 0.02:
                 w_lip = np.clip(lip3d[0] * 1.4 * maps.lip_opacity, 0, 1
-                                ).astype(np.float32) * gate
+                                ).astype(np.float32) * gate_anch
                 cent = np.clip(lip3d[1], 0, 1)
                 core2 = _load_core()
                 lip_tgt = np.clip(core2.sample_ramp(maps.lip_stops, cent), 0, 1)
             else:                                   # 兜底：UV 唇带（带真实目标色）
-                w_lip = lip_uv * gate
+                w_lip = lip_uv * gate_anch
                 if maps.lip_albedo is not None:
                     if maps.lip_cent is not None:
                         cent = smp(maps.lip_cent).astype(np.float32)
@@ -652,6 +692,9 @@ class UvMakeupBaker:
                 kL = np.where(zone, lip_kL, kL)
                 chroma = np.where(zone, lip_ch, chroma)
                 lip_zone = zone            # 材质通道在唇区显式覆盖（见下）
+            cent_out = np.where(zone, np.asarray(cent, np.float32), 0.0)
+        else:
+            cent_out = np.zeros(len(w), np.float32)
 
         cur = np.clip(np.asarray(cloud["rgba"], np.float64)[:, :3], 0, 1)
         rough_raw = smp(maps.channels["rough"]).astype(np.float32)
@@ -677,7 +720,7 @@ class UvMakeupBaker:
             sss_f, sheen_f = sss_raw, sheen_raw
         return {"tx": tx, "ty": ty, "w": w, "gate": gate, "tgt": tgt,
                 "kL": kL, "chroma": chroma, "cur": cur, "hp": hp,
-                "lip_zone": lip_zone,
+                "lip_zone": lip_zone, "cent": cent_out,
                 "rough_raw": rough_raw, "coat_raw": coat_raw,
                 "sss_raw": sss_raw, "sheen_raw": sheen_raw,
                 "rough": rough_f.astype(np.float32), "coat": coat_f.astype(np.float32),
@@ -882,3 +925,144 @@ def merge_makeup_layer(base: dict[str, np.ndarray], layer: dict[str, np.ndarray]
             np.concatenate([mb.sss, ml.sss]).astype(np.float32),
             np.concatenate([mb.sheen, ml.sheen]).astype(np.float32))
     return out
+
+
+def subdivide_makeup_layer(base_cloud: dict[str, np.ndarray],
+                           layer: dict[str, np.ndarray], src_idx: np.ndarray,
+                           pack, uv: np.ndarray, valid: np.ndarray,
+                           min_grad: float = 0.12, child_gain: float = 0.92,
+                           scale_keep: float = 0.55,
+                           ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """妆容壳层高频区 2×2 分裂加密（导出 ply 的妆缘锐度）。
+
+    壳层 splat 沿底模足迹生成，常数色足迹就是导出形态的边缘锐度上限
+    （2048² 贴图只在 splat 中心被采样）。对妆权重在自身足迹内有梯度的壳层
+    splat（|Δw| > min_grad，即妆缘/唇线/眼线）沿两条主轴分裂为 2×2 子高斯：
+        子 splat UV   kNN 雅可比（邻域 Δxyz→Δuv 最小二乘）从父 UV 外推；
+        颜色/权重/材质 从 pack 按子 UV 重采样 + 同式完整 Lab 迁移——妆缘
+                      跟随贴图细节，不再是父 splat 常数色的放大；
+        scale         主轴 ×scale_keep（轻微重叠防缝），薄轴不变；
+        opacity       父 ×child_gain（4 子聚合覆盖略高于父，边缘更实）。
+    平缓区（大面积底妆内部）|Δw| 小不分裂——增长只花在刀刃上。pack 缺失
+    （旧调用方）或分裂收益为 0 时原样返回。"""
+    n_l = len(src_idx)
+    if n_l == 0 or pack is None or getattr(pack, "w", None) is None:
+        return layer, src_idx
+    from .makeup_pack import sample_uv
+    from .normals import _quats_to_rotmats
+
+    xyz_b = np.asarray(base_cloud["xyz"], np.float64)
+    uv_b = np.clip(np.asarray(uv, np.float64), 0.0, 1.0)
+    valid_b = np.asarray(valid, bool)
+
+    # ---- kNN UV 雅可比：J (n_l,3,2)，Δxyz → Δuv 最小二乘（岭正则防退化） ----
+    fl = cv2.flann_Index(np.ascontiguousarray(xyz_b, np.float32),
+                         dict(algorithm=1, trees=4, checks=64))
+    _nn, d2 = fl.knnSearch(np.ascontiguousarray(xyz_b[src_idx], np.float32), 9,
+                           params=dict(checks=64))
+    nb_idx = _nn[:, 1:].astype(np.int64)                     # 去自身（d=0 列）
+    nb = xyz_b[nb_idx] - xyz_b[src_idx][:, None, :]          # (m,8,3)
+    duv = uv_b[nb_idx] - uv_b[src_idx][:, None, :]           # (m,8,2)
+    J = np.zeros((n_l, 3, 2), np.float64)
+    A = np.einsum("mki,mkj->mij", nb, nb)                    # (m,3,3)
+    B = np.einsum("mki,mkj->mij", nb, duv)                   # (m,3,2)
+    tr = A[:, 0, 0] + A[:, 1, 1] + A[:, 2, 2]
+    ridge = (1e-9 * np.maximum(tr, 1e-12) + 1e-12)[:, None, None] \
+        * np.eye(3, dtype=np.float64)[None]
+    J = np.linalg.solve(A + ridge, B)
+
+    # ---- 分裂决策：子足迹内的 w 梯度 ----
+    R = _quats_to_rotmats(np.asarray(layer["rot"], np.float64))
+    s = np.asarray(layer["scale"], np.float64)
+    order = np.argsort(-s, axis=1)                           # 主轴优先
+    ia, ib = order[:, 0], order[:, 1]
+    e_a = np.take_along_axis(R, ia[:, None, None], axis=2)[..., 0]   # (m,3) 主轴列
+    e_b = np.take_along_axis(R, ib[:, None, None], axis=2)[..., 0]
+    sa = np.take_along_axis(s, ia[:, None], 1)               # (m,1) 主轴半长
+    sb = np.take_along_axis(s, ib[:, None], 1)
+    sign = np.array([1.0, -1.0])
+    term_a = (e_a.reshape(n_l, 1, 1, 3) * sa.reshape(n_l, 1, 1, 1)
+              * sign.reshape(1, 2, 1, 1))                      # (m,2,1,3) ±主轴a
+    term_b = (e_b.reshape(n_l, 1, 1, 3) * sb.reshape(n_l, 1, 1, 1)
+              * sign.reshape(1, 1, 2, 1))                      # (m,1,2,3) ±主轴b
+    off = (0.5 * (term_a + term_b)).reshape(n_l, 4, 3)
+    d_uv = np.einsum("mji,mkj->mki", J, off)                 # (m,4,2) 子 uv 偏移
+    uv_c = np.clip(uv_b[src_idx][:, None, :] + d_uv, 0.0, 1.0)
+    w_c = sample_uv(pack.w, uv_c[..., 0].ravel(), uv_c[..., 1].ravel()
+                    ).reshape(n_l, 4)
+    split = (w_c.max(1) - w_c.min(1)) > float(min_grad)
+    if not split.any():
+        return layer, src_idx
+
+    # ---- 子 splat 属性（向量化：未分裂行原样 + 分裂行 4 子展开） ----
+    cur = np.clip(np.asarray(base_cloud["rgba"], np.float64)[src_idx][:, :3], 0, 1)
+    tgt_c = sample_uv(pack.albedo, uv_c[..., 0].ravel(),
+                      uv_c[..., 1].ravel()).reshape(n_l, 4, 3)
+    kL_c = sample_uv(pack.kL, uv_c[..., 0].ravel(), uv_c[..., 1].ravel()).reshape(n_l, 4)
+    ch_c = sample_uv(pack.chroma, uv_c[..., 0].ravel(), uv_c[..., 1].ravel()).reshape(n_l, 4)
+    col_c = UvMakeupBaker._lab_migrate(
+        np.repeat(cur, 4, axis=0), tgt_c.reshape(-1, 3),
+        kL_c.ravel(), ch_c.ravel(),
+        np.ones(n_l * 4), full=True).reshape(n_l, 4, 3)
+    op_p = np.clip(np.asarray(layer["rgba"], np.float64)[:, 3], 1e-4, 0.98)
+    op_c = np.clip(op_p[:, None] * float(child_gain), 1e-4, 0.98)
+    mat_c = {k: sample_uv(getattr(pack, k), uv_c[..., 0].ravel(),
+                          uv_c[..., 1].ravel()).reshape(n_l, 4)
+             for k in ("rough", "coat", "sss", "sheen")}
+    # 未分裂行材质 = 父 UV 处采样（子行用各自子 UV 采样值）
+    uv_p = uv_b[src_idx]
+    mat_p = {k: sample_uv(getattr(pack, k), uv_p[:, 0], uv_p[:, 1])
+             for k in ("rough", "coat", "sss", "sheen")}
+
+    keep = ~split
+    sp = np.nonzero(split)[0]                    # 分裂行索引（层内行号）
+    m_s = len(sp)
+    rep = np.repeat(np.arange(m_s), 4)           # 子行 → 分裂行
+
+    def _take(key: str, arr: np.ndarray | None) -> np.ndarray | None:
+        """未分裂行原样 + 分裂行 4 子（4× repeat 后按子属性覆盖）。"""
+        if arr is None:
+            return None
+        a = arr[keep]
+        if m_s == 0:
+            return a
+        return np.concatenate([a, arr[sp][rep]], axis=0)
+
+    out_layer: dict[str, np.ndarray] = {}
+    for k, v in layer.items():
+        if k == "material" or not isinstance(v, np.ndarray) or v.shape[:1] != (n_l,):
+            continue
+        out_layer[k] = _take(k, v)
+    if m_s:
+        out_layer["xyz"] = np.concatenate([
+            layer["xyz"][keep],
+            (layer["xyz"][sp][:, None, :] + off[sp]).reshape(-1, 3),
+        ], 0).astype(np.float32)
+        sc = np.repeat(layer["scale"][sp], 4, axis=0).astype(np.float64)
+        ia_s, ib_s = ia[sp][rep], ib[sp][rep]
+        sc[np.arange(m_s * 4), ia_s] *= float(scale_keep)
+        sc[np.arange(m_s * 4), ib_s] *= float(scale_keep)
+        out_layer["scale"] = np.concatenate([
+            layer["scale"][keep], sc], 0).astype(np.float32)
+        col_s = np.clip(col_c[sp].reshape(-1, 3), 0, 1).astype(np.float32)
+        op_s = np.repeat(op_c[sp], 4, axis=0).reshape(-1, 1).astype(np.float32)
+        out_layer["rgba"] = np.concatenate([
+            layer["rgba"][keep],
+            np.concatenate([col_s, op_s], 1)], 0)
+    else:
+        out_layer["rgba"] = layer["rgba"]
+    out_layer["makeup_w"] = np.concatenate([
+        layer["makeup_w"][keep],
+        w_c[sp].reshape(-1)]).astype(np.float32)
+    from .pbr import Material, rough_to_shin
+
+    rough = np.concatenate([mat_p["rough"][keep], mat_c["rough"][sp].reshape(-1)])
+    coat = np.concatenate([mat_p["coat"][keep], mat_c["coat"][sp].reshape(-1)])
+    sss = np.concatenate([mat_p["sss"][keep], mat_c["sss"][sp].reshape(-1)])
+    sheen = np.concatenate([mat_p["sheen"][keep], mat_c["sheen"][sp].reshape(-1)])
+    out_layer["material"] = Material(rough.astype(np.float32), coat.astype(np.float32),
+                                     sss.astype(np.float32), sheen.astype(np.float32))
+    out_layer["gloss"] = out_layer["material"].coat.copy()
+    out_layer["shin"] = rough_to_shin(out_layer["material"].rough).astype(np.float32)
+    src_out = np.concatenate([src_idx[keep], np.repeat(src_idx[sp], 4)])
+    return out_layer, src_out.astype(np.int64)

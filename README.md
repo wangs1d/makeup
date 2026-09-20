@@ -33,6 +33,11 @@ python preview/run_photoreal.py --video 我的视频.mp4 \
 # 2) 换妆（秒级，复用资产）
 cd desktop-app && python -m makeupstudio.face3dgs makeup -p ../out/scan \
     --spec ../makeup-skill/presets/date-rose.json
+
+# 3) 离线高保真交付（定妆照 + RGBA 抠图层 + turntable.mp4 + 素颜对比）
+python -m makeupstudio.face3dgs render -p ../out/scan --sfm ../out/scan/sfm/sparse/1 \
+    --background studio --light warm --size 1080 --ssaa 2
+#    质量门禁：C 级资产（低清源）默认拒绝出图（--force 仅诊断）；denoise 按分级自动
 ```
 
 ## 旧链路退役说明
@@ -116,8 +121,8 @@ python makeup-skill/scripts/render_look.py --spec makeup-skill/presets/date-rose
 ## 测试
 
 ```bash
-python -m pytest tests/ -q     # 84 项：画像管线（PLY/语义/编译器/光栅）/追踪协议/蒙版规则/渲染/
-                               # bridge 路由/资产侧车/教练状态机/C#·shader 静态检查
+python -m pytest tests/ -q     # 182 项：画像管线（PLY/语义/编译器/光栅）/追踪协议/蒙版规则/渲染/
+                               # bridge 路由/资产侧车/教练状态机/交付商业化门禁/C#·shader 静态检查
 ```
 
 ## 目录

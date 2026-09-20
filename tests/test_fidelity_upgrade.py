@@ -500,7 +500,10 @@ def test_apply_makeup_to_asset_layer_mode_default(canonical_cloud, tmp_path):
     assert len(made["xyz"]) > n_b                              # 壳层真实存在
     assert np.abs(made["rgba"][:n_b] - cloud["rgba"]).max() < 1e-6
     assert (made["makeup_w"][n_b:] > 0.02).any()
-    # 壳层 splat 落在对应底模 splat 足迹内（薄层偏移 ≤ 0.16×min_scale）
+    # 壳层 splat 落在对应底模 splat 足迹内。薄层法线偏移 0.15×min_scale；
+    # 妆缘高频区 2×2 分裂的子 splat 另有足迹内切向偏移（±0.5σ 两条主轴，
+    # 各向同性时 √(0.5²+0.5²)≈0.71σ）——合计 ≤ ~0.85×min_scale，仍在父足迹
+    # 内（未离面），远小于任何可见的"漂浮"量级。
     layer_xyz = made["xyz"][n_b:]
     src_w = made["makeup_w"][n_b:]
     # 每个壳层 splat 的最近底模 splat 就是其对应者（薄层偏移量级）
@@ -510,7 +513,7 @@ def test_apply_makeup_to_asset_layer_mode_default(canonical_cloud, tmp_path):
     _nn, d2 = fl.knnSearch(layer_xyz.astype(np.float32), 1, params=dict(checks=64))
     d = np.sqrt(np.maximum(d2, 0))
     thin_med = float(np.median(np.asarray(cloud["scale"], np.float64).min(axis=1)))
-    assert d.max() <= 0.16 * thin_med * 1.01
+    assert d.max() <= 0.85 * thin_med * 1.05
     assert src_w.max() > 0.5
 
 

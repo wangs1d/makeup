@@ -26,7 +26,9 @@ from ...tracker import FaceTracker
 from ..fit_makeup import FaceMakeupFitter
 from . import train_base as tb
 from .frames import FrameSelection, select_frames
-from .makeup_uv import UvMakeupBaker, UvMakeupMaps, merge_makeup_layer
+from .makeup_pack import compose_pack
+from .makeup_uv import UvMakeupBaker, UvMakeupMaps, merge_makeup_layer, \
+    subdivide_makeup_layer
 from .render_pbr import render_cloud_pbr
 from .train_base import TrainConfig, build_views
 from .uvbind import bind_uv
@@ -87,6 +89,35 @@ def _triangulate_landmarks(model: colmap_io.SparseModel, sel: FrameSelection,
     if (np.linalg.norm(L, axis=1) > 0).sum() < 200:
         raise RuntimeError("地标三角化失败（<200 个有效），检查位姿/检测质量")
     return L
+
+
+def prune_off_surface(cloud: dict[str, np.ndarray], landmarks: np.ndarray,
+                      k_spacing: float = 3.0) -> dict[str, np.ndarray]:
+    """离面漂浮物剪枝：距最近三角化地标 > k_spacing×地标间距 的 splat 剔除。
+
+    训练剪枝按 2D 投影投票——贴脸漂浮的垃圾（低清源 + 旧初始化带入的背景
+    点再生长）投影落在脸区内，投票杀不掉，渲染成脸部彩点/雾团（实测在
+    干净重训资产上仍占 ~9%）。三角化地标贴在脸表面，表面 splat 距最近
+    地标 ≤ ~3 个地标间距，漂浮物远大于此（实测分布双峰：0.28 / 3.1）。
+    地标无效（<200 个）时原样返回。"""
+    import cv2
+
+    lm = np.asarray(landmarks, np.float64)
+    lv = lm[np.linalg.norm(lm, axis=1) > 0].astype(np.float32)
+    if len(lv) < 200 or len(cloud["xyz"]) == 0:
+        return cloud
+    spacing = float(np.median(np.sqrt(cv2.flann_Index(
+        lv, dict(algorithm=1, trees=4, checks=64)).knnSearch(lv, 2,
+        params=dict(checks=64))[1][:, 1])))
+    thr = k_spacing * max(spacing, 1e-6)
+    xyz = np.ascontiguousarray(cloud["xyz"], np.float32)
+    fl = cv2.flann_Index(lv, dict(algorithm=1, trees=4, checks=64))
+    _n, d2 = fl.knnSearch(xyz, 1, params=dict(checks=64))
+    keep = np.sqrt(np.maximum(d2[:, 0], 0)) <= thr
+    if int(keep.sum()) == len(xyz):
+        return cloud
+    return {k: (v[keep] if isinstance(v, np.ndarray)
+                and v.shape[:1] == (len(xyz),) else v) for k, v in cloud.items()}
 
 
 def export_material(made: dict[str, np.ndarray], out_dir: Path,
@@ -175,10 +206,16 @@ def build_asset(project_dir: str | Path, sfm_dir: str | Path,
             views, init_ply, out_dir, train_cfg,
             on_progress=lambda f, m: cb("train", f, m))
 
-    # ---- 3. 地标三角化 ----
+    # ---- 3. 地标三角化 + 离面漂浮物剪枝 ----
     cb("bind", 0.2, "三角化 468 地标…")
     landmarks = _triangulate_landmarks(model, sel, px_scale=px_scale)
     np.save(out_dir / "landmarks.npy", landmarks)
+    n0 = len(cloud["xyz"])
+    cloud = prune_off_surface(cloud, landmarks)
+    if len(cloud["xyz"]) != n0:
+        cb("bind", 0.4, f"离面漂浮物剪枝 {n0} -> {len(cloud['xyz'])}")
+        from ..splat_io import write_ply as _write
+        _write(cloud, out_dir / "base.ply")
     return cloud, sel, landmarks, model, train_report
 
 
@@ -187,6 +224,7 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
                           intensity: float = 0.8,
                           guidance: list[dict] | None = None,
                           as_layer: bool = True,
+                          subdivide: bool = True,
                           progress: ProgressCB | None = None) -> dict:
     """在 3DGS 资产上渲染妆容：UV 绑定 → 目标场合成 → 3D 锚定 → 烘焙导出。
 
@@ -196,6 +234,10 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
     妆色×底模真实纹理、finish 材质、opacity=w×底模、sh_rest 置零），底模
     本身保持素颜；合并点云导出 madeup.ply/.splat。妆在几何上存在，不依赖
     底模 splat 的颜色被改写。as_layer=False 退回原位 Lab 重染色（诊断用）。
+    subdivide=True（默认）：壳层妆缘高频区 2×2 分裂加密（导出形态的妆缘
+    锐度跟随 2048² 贴图，不再受父 splat 足迹限制）。
+    同时产物 makeup_maps.npz（妆容 UV 图集）：3D 锚定权重 + UV 目标场融合
+    ——离线渲染的逐像素合成（makeup_pack）与跨用户 preset 复用都消费它。
     3D 锚定区域：唇（lip_band_3d）+ 眼线/睫毛/眉（landmark_band_3d）——
     canonical 模板在这些高频区域有 ~2% 系统错位，观测地标带优先、UV 蒙版兜底。
     guidance：_render_guidance_views 产物存在时，先聚合进 UV albedo
@@ -219,7 +261,17 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
     if any(l.get("region") == "lipstick" for l in layers):
         try:
             lip3d = baker.lip_band_3d(cloud, landmarks)
-            cb("makeup", 0.55, f"3D 唇带 splats={int((lip3d[0] > 0.02).sum())}")
+            # 覆盖下限：三角化地标不可靠时 3D 唇带会稀疏到几乎没画上，
+            # 低于 UV 兜底可覆盖数的 30% 时回退 UV 兜底（canonical 模板
+            # 唇带 ~2% 错位仍远好于"唇上没涂到妆"）
+            n3d = int((lip3d[0] > 0.05).sum())
+            n_uv = baker.uv_lip_coverage(maps, binding.uv, binding.valid)
+            if n3d >= max(200, int(0.3 * n_uv)):
+                cb("makeup", 0.55, f"3D 唇带 splats={n3d}（UV 兜底参照 {n_uv}）")
+            else:
+                cb("makeup", 0.55, f"3D 唇带覆盖过稀（{n3d} < 30%×UV {n_uv}），"
+                                   "回退 UV 兜底")
+                lip3d = None
         except RuntimeError as e:
             cb("makeup", 0.55, f"3D 唇带失败（回退 UV 兜底）：{e}")
     for l in layers:
@@ -230,9 +282,15 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
             bw, bc = baker.landmark_band_3d(
                 cloud, landmarks, region, l.get("shape") or {},
                 strength=float(l.get("opacity", 0.7)) * intensity * 1.3)
-            if float(np.max(bw)) > 0.02:
+            # 覆盖下限：三角化地标不可靠时（文档已知问题）锚定带会稀疏到
+            # 几乎没画上（实测 2-18 splats），此时必须回退 UV 模板而非"成功"
+            n_cover = int((bw > 0.05).sum())
+            if float(np.max(bw)) > 0.02 and n_cover >= 50:
                 bands3d[region] = (bw, bc)
-                cb("makeup", 0.6, f"3D {region} splats={int((bw > 0.02).sum())}")
+                cb("makeup", 0.6, f"3D {region} splats={n_cover}")
+            else:
+                cb("makeup", 0.6, f"3D {region} 覆盖过稀（{n_cover} splats），"
+                                  "回退 UV 模板")
         except (RuntimeError, ValueError) as e:
             cb("makeup", 0.6, f"3D {region} 失败（回退 UV 模板）：{e}")
 
@@ -241,13 +299,11 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
             layer, src_idx = baker.build_makeup_layer(
                 cloud, m, binding.uv, binding.valid,
                 lip3d=lip3d, near=binding.near, bands3d=bands3d or None)
-            made_m = merge_makeup_layer(cloud, layer, src_idx)
             if len(src_idx):
-                # 薄层自检：壳层 splat 必须落在对应底模 splat 的足迹内
-                # （偏移 ≤ 0.3×min_scale；0 = 纯重叠，默认含薄层厚度）
+                # 薄层自检（分裂前：纯法线偏移语义）——壳层 splat 必须落在
+                # 对应底模 splat 的足迹内（偏移 ≤ 0.3×min_scale）
                 base_xyz = np.asarray(cloud["xyz"], np.float32)
-                off = np.linalg.norm(made_m["xyz"][len(cloud["xyz"]):]
-                                     - base_xyz[src_idx], axis=1)
+                off = np.linalg.norm(layer["xyz"] - base_xyz[src_idx], axis=1)
                 thin = np.asarray(cloud["scale"], np.float64)[src_idx].min(axis=1)
                 ratio = off / np.maximum(thin, 1e-12)
                 flag = "✓" if float(ratio.max()) <= 0.3 + 1e-6 else "✗ 超限"
@@ -256,6 +312,24 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
                                   f"/max={float(ratio.max()):.2f}×min_scale {flag}")
             else:
                 cb("makeup", 0.7, "妆容壳层为空（妆权重低于门限）")
+            # 妆容 UV 图集：3D 锚定权重 + UV 目标场融合（与壳层同一 _assignment
+            # 语义）——逐像素交付渲染与跨用户复用的数据源
+            pack = compose_pack(baker, cloud, m, binding.uv, binding.valid,
+                                lip3d=lip3d, near=binding.near,
+                                bands3d=bands3d or None)
+            if subdivide and len(src_idx):
+                n_before = len(src_idx)
+                layer, src_idx = subdivide_makeup_layer(
+                    cloud, layer, src_idx, pack, binding.uv, binding.valid)
+                if len(src_idx) > n_before:
+                    cb("makeup", 0.72, f"壳层妆缘加密 {n_before} → "
+                                       f"{len(src_idx)} splats（2×2 分裂）")
+            made_m = merge_makeup_layer(cloud, layer, src_idx)
+            pack.uv = np.asarray(binding.uv, np.float64)
+            pack.valid = np.asarray(binding.valid, bool)
+            pack.save(out_dir / "makeup_maps.npz")
+            cb("makeup", 0.75, f"妆容 pack → makeup_maps.npz（tex={pack.tex}，"
+                               f"像素渲染/跨用户复用就绪）")
             return made_m
         return baker.apply_to_cloud(cloud, m, binding.uv, binding.valid,
                                     lip3d=lip3d, intensity=intensity,
@@ -359,13 +433,43 @@ def _render_guidance_views(cloud: dict, model: colmap_io.SparseModel,
     return views or None
 
 
+# shape 参数阈值：超过即视为"形状级还原"需求——参数化 UV 模板在这些自由度
+# 上是插值近似（wing 的走向/烟熏的渐变形状无法由色带+蒙版参数完全表达），
+# 应走"参数化打底 + guidance 精修"主路径（AvatarMakeup 语义）。
+SHAPE_HEAVY_RULES = (
+    ("eyeliner", "wing", 0.20), ("eyeliner", "thickness", 0.70),
+    ("lashes", "thickness", 0.70), ("eyeshadow", "spread", 0.90),
+    ("lipstick", "gradation", 0.30), ("eyebrow", "thickness", 0.70),
+)
+
+
+def wants_guidance(spec: dict) -> bool:
+    """spec 的 shape 参数是否超出参数化模板的表达精度（应 guidance 精修）。"""
+    for l in spec.get("layers", []):
+        if not l.get("enabled", True):
+            continue
+        shape = l.get("shape") or {}
+        for region, key, thr in SHAPE_HEAVY_RULES:
+            if l.get("region") == region:
+                try:
+                    if float(shape.get(key, 0) or 0) >= thr:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+    return False
+
+
 def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
                   init_ply: str | Path, spec: dict, out_dir: str | Path,
                   train_cfg: TrainConfig | None = None,
                   tex: int = 2048, intensity: float = 0.8,
                   reuse_base: bool = True,
+                  reference: str | Path | None = None,
                   progress: ProgressCB | None = None) -> PhotorealResult:
-    """一键：build_asset（选帧/训练/地标）+ apply_makeup_to_asset（上妆/导出）。"""
+    """一键：build_asset（选帧/训练/地标）+ apply_makeup_to_asset（上妆/导出）。
+
+    reference：妆效参考图路径（与 CLI --reference 同源）——除颜色标定外，
+    还原度 ΔE00 超出验收预算时用于自动重标定重烘一次（fidelity gate）。"""
     cb = progress or (lambda *a: None)
     t0 = time.time()
     out_dir = Path(out_dir)
@@ -373,13 +477,26 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
     cloud, sel, landmarks, model, train_report = build_asset(
         project_dir, sfm_dir, init_ply, out_dir, train_cfg=train_cfg,
         reuse_base=reuse_base, progress=progress)
-    cb("bind", 1.0, "资产就绪")
+    from .quality import assess_quality
+    quality = assess_quality((model.camera.width, model.camera.height),
+                             train_report.get("psnr_mean"), len(cloud["xyz"]))
+    cb("bind", 1.0, f"资产就绪（质量 {quality.grade}"
+                     f"{'；'.join(quality.reasons) and '：' + '；'.join(quality.reasons) or ''}）")
 
     # ---- guidance（可选）：spec.guidance.reference 存在且 Stable-Makeup 就绪 ----
     guidance = None
+    guidance_auto = False
     if spec.get("guidance"):
         cb("guidance", 0.0, "素颜多视角渲染 × Stable-Makeup…")
         guidance = _render_guidance_views(cloud, model, sel, out_dir, spec, cb)
+    elif reference and wants_guidance(spec):
+        # ③ shape 重的 spec + 参考图 → guidance 自动升为主路径：
+        # 参数化烘焙只作打底，形状级还原交给图像空间精修。环境缺失时
+        # _render_guidance_views 优雅跳过（参数化结果照常交付）。
+        cb("guidance", 0.0, "shape 重的 spec + 参考图 → 自动 guidance 优先路径…")
+        spec.setdefault("guidance", {})["reference"] = str(reference)
+        guidance = _render_guidance_views(cloud, model, sel, out_dir, spec, cb)
+        guidance_auto = guidance is not None
 
     made, coverage = apply_makeup_to_asset(
         cloud, landmarks, spec, out_dir, tex=tex,
@@ -399,10 +516,32 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
     previews, madeup_renders = _render_previews(model, sel, cloud, made,
                                                 images_dir, out_dir)
 
-    # ---- 还原度度量：渲染帧妆区 vs spec 目标色的逐区域 ΔE00 ----
+    # ---- 还原度度量 + 验收门：渲染帧妆区 vs spec 目标色的逐区域 ΔE00 ----
     delta_e = _delta_e_report(spec, sel, madeup_renders, images_dir)
     cb("export", 0.5, "还原度 ΔE00 " + (str(delta_e.get("_mean", "n/a"))
                                         if delta_e else "（无妆区可评）"))
+    from .calibrate import FIDELITY_RETRY_BOOST, boost_spec_regions, fidelity_gate
+    gate = fidelity_gate(delta_e)
+    if gate["status"] == "over" and reference and not guidance:
+        # 自动重标定：超预算区域提浓度重烘一次（颜色不动，浓度收差）
+        cb("export", 0.55, f"ΔE00 超预算 {gate['over']} → 重标定重烘"
+                           f"（opacity ×{FIDELITY_RETRY_BOOST}）")
+        spec = boost_spec_regions(spec, gate["over"])
+        made, coverage = apply_makeup_to_asset(
+            cloud, landmarks, spec, out_dir, tex=tex, intensity=intensity,
+            progress=progress)
+        previews, madeup_renders = _render_previews(model, sel, cloud, made,
+                                                    images_dir, out_dir)
+        delta_e = _delta_e_report(spec, sel, madeup_renders, images_dir)
+        retry = fidelity_gate(delta_e)
+        gate = {"status": "recalibrated_passed" if retry["status"] == "passed"
+                else "degraded", "over": retry["over"],
+                "first": gate, "retry": retry}
+        cb("export", 0.6, f"重标定后 ΔE00 mean={delta_e.get('_mean', 'n/a')} "
+                          f"status={gate['status']}")
+    elif gate["status"] == "over":
+        gate = {**gate, "note": "无参考图（或 guidance 链路已介入），"
+                                "未自动重标定——建议 --reference 重跑或调整 spec"}
 
     # ---- 导出 ----
     from ..splat_io import export_splat, write_ply
@@ -412,13 +551,15 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
     report = {
         "frames_selected": len(sel.names), "frames_rejected": len(sel.rejected),
         "ref_frame": sel.ref, "train": train_report,
+        "quality": quality.to_dict(),
         "splats": int(len(made["xyz"])),
         "makeup_layer_splats": int((np.asarray(made["makeup_w"]) > 0.02).sum()),
         "uv_tex": tex, "makeup_coverage": round(coverage, 4),
         "layers": [l.get("id", l.get("region")) for l in spec.get("layers", [])
                    if l.get("enabled", True)],
-        "guidance": bool(guidance),
+        "guidance": bool(guidance), "guidance_auto": guidance_auto,
         "makeup_delta_e": delta_e,
+        "fidelity_gate": gate,
         "seconds": round(time.time() - t0, 1),
     }
     (out_dir / "report.json").write_text(json.dumps(
@@ -436,7 +577,8 @@ def _delta_e_report(spec: dict, sel: FrameSelection,
 
     蒙版由该帧 MediaPipe 观测地标（sel.px）栅格化，与渲染帧同分辨率——
     与烘焙用同一套区域语义，度量的是"交付图里的妆色离 spec 目标多远"。"""
-    from .calibrate import image_region_masks, region_delta_e, spec_targets
+    from .calibrate import (exclude_region_overlap, image_region_masks,
+                            region_delta_e, spec_targets)
 
     targets = spec_targets(spec)
     if not targets or not madeup_renders:
@@ -454,8 +596,8 @@ def _delta_e_report(spec: dict, sel: FrameSelection,
         px_s = px.copy()
         px_s[:, 0] *= size / w
         px_s[:, 1] *= size / h
-        masks = image_region_masks(px_s, size, size,
-                                   regions=tuple(targets.keys()))
+        masks = exclude_region_overlap(image_region_masks(
+            px_s, size, size, regions=tuple(targets.keys())))
         per = region_delta_e(img_m[..., ::-1], masks, targets)
         for rgn, v in per.items():
             acc.setdefault(rgn, []).append(v)

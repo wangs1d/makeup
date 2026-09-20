@@ -1,0 +1,170 @@
+{
+  "spec_version": "1.0",
+  "name": "sweet-peach",
+  "description": "蜜桃甜心：水光肌+蜜桃橙眼影+大范围笑颜腮红+咬唇妆，元气减龄",
+  "intensity": 0.9,
+  "layers": [
+    {
+      "id": "foundation-both",
+      "region": "foundation",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.65,
+      "finish": "dewy",
+      "color_stops": [
+        {"at": 0.0, "hex": "#F6DAC8"},
+        {"at": 1.0, "hex": "#F3D4BF"}
+      ],
+      "shape": {"coverage": "light"},
+      "texture_strength": 0.15,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyebrow-both",
+      "region": "eyebrow",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.5,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#8A5E42"},
+        {"at": 1.0, "hex": "#75503A"}
+      ],
+      "shape": {"thickness": 0.5, "arch": 0.4, "tint": 0.7},
+      "texture_strength": 0.45,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyeshadow-left",
+      "region": "eyeshadow",
+      "side": "left",
+      "enabled": true,
+      "opacity": 0.78,
+      "finish": "satin",
+      "color_stops": [
+        {"at": 0.0, "hex": "#F5C49A"},
+        {"at": 1.0, "hex": "#E08A5E"}
+      ],
+      "shape": {"spread": 0.55, "height": 0.35, "angle_deg": 5, "lower_lid": 0.7},
+      "texture_strength": 0.25,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyeshadow-right",
+      "region": "eyeshadow",
+      "side": "right",
+      "enabled": true,
+      "opacity": 0.78,
+      "finish": "satin",
+      "color_stops": [
+        {"at": 0.0, "hex": "#F5C49A"},
+        {"at": 1.0, "hex": "#E08A5E"}
+      ],
+      "shape": {"spread": 0.55, "height": 0.35, "angle_deg": 5, "lower_lid": 0.7},
+      "texture_strength": 0.25,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyeliner-left",
+      "region": "eyeliner",
+      "side": "left",
+      "enabled": true,
+      "opacity": 0.6,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#54382C"},
+        {"at": 1.0, "hex": "#54382C"}
+      ],
+      "shape": {"thickness": 0.2, "wing": 0.15, "lower": 0.3},
+      "texture_strength": 0.0,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyeliner-right",
+      "region": "eyeliner",
+      "side": "right",
+      "enabled": true,
+      "opacity": 0.6,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#54382C"},
+        {"at": 1.0, "hex": "#54382C"}
+      ],
+      "shape": {"thickness": 0.2, "wing": 0.15, "lower": 0.3},
+      "texture_strength": 0.0,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "blush-left",
+      "region": "blush",
+      "side": "left",
+      "enabled": true,
+      "opacity": 0.8,
+      "finish": "satin",
+      "color_stops": [
+        {"at": 0.0, "hex": "#F7B296"},
+        {"at": 1.0, "hex": "#F08A6E"}
+      ],
+      "shape": {"radius": 0.17, "angle_deg": 0, "falloff": 0.75},
+      "texture_strength": 0.3,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "blush-right",
+      "region": "blush",
+      "side": "right",
+      "enabled": true,
+      "opacity": 0.8,
+      "finish": "satin",
+      "color_stops": [
+        {"at": 0.0, "hex": "#F7B296"},
+        {"at": 1.0, "hex": "#F08A6E"}
+      ],
+      "shape": {"radius": 0.17, "angle_deg": 0, "falloff": 0.75},
+      "texture_strength": 0.3,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "highlight-both",
+      "region": "highlight",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.4,
+      "finish": "dewy",
+      "color_stops": [
+        {"at": 0.0, "hex": "#FCE9D8"},
+        {"at": 1.0, "hex": "#FFF6EA"}
+      ],
+      "shape": {"areas": ["cheek", "cupid", "chin"]},
+      "texture_strength": 0.08,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "lipstick-both",
+      "region": "lipstick",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.9,
+      "finish": "gloss",
+      "color_stops": [
+        {"at": 0.0, "hex": "#D4585E"},
+        {"at": 0.55, "hex": "#EC7A72"},
+        {"at": 1.0, "hex": "#F49A8C"}
+      ],
+      "shape": {"overline": 0.02, "blur": 0.15, "gradation": 0.8},
+      "texture_strength": 0.05,
+      "render": {"type": "splat", "splat": {"thickness": 0.0018, "density": 0.85}}
+    }
+  ],
+  "steps": [
+    {"order": 1, "area": "base", "regions": ["foundation"],
+     "instruction": "水光粉底薄涂，苹果肌保留自然光泽"},
+    {"order": 2, "area": "eye", "regions": ["eyeshadow", "eyeliner"],
+     "instruction": "蜜桃橙铺眼皮前半段，下睑卧蚕处带过；眼线只填内眼角到眼中"},
+    {"order": 3, "area": "blush", "regions": ["blush", "highlight"],
+     "instruction": "腮红以笑肌为中心大范围打圈（微醺感），鼻尖下巴点高光"},
+    {"order": 4, "area": "lip", "regions": ["lipstick"],
+     "instruction": "咬唇画法：唇中涂深红向外晕染成渐变，外圈留唇色，最后叠唇蜜"}
+  ],
+  "source": {"type": "preset", "origin": "built-in", "created_at": "2026-09-19"}
+}

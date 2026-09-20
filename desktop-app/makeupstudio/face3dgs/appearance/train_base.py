@@ -41,7 +41,11 @@ class TrainConfig:
     antialiased: bool = True         # Mip-Splatting 式 2D 滤波：拉近拉远不呼吸
     mip3d_gamma: float = 0.3         # 3D 平滑滤波 γ：尺度下限=γ×近邻距（0=关）；
                                      # 训练分辨率下亚像素 splat 的点采样花斑主修复
-    hull_margin: float = 1.12        # 地标凸包外扩（含发际边缘，不含背景墙）
+    hull_margin: float = 1.12        # 蒙版外扩（含发际边缘，不含背景墙）
+    mask_shape: str = "hull"         # "hull"=468 点凸包（凸，覆盖发型）；"oval"=
+                                     # FACE_OVAL 轮廓多边形（跟随脸型含凹陷）——
+                                     # 光头/贴脸背景（凸包凹陷区是背景）必须用 oval，
+                                     # 否则背景被"合法"训进资产（实测满屏彩点）
     feather_px: int = 13             # 蒙版羽化（软权重）
     eval_holdout: int = 6            # 留出验证帧数
     seed: int = 0
@@ -88,13 +92,18 @@ def build_views(model: colmap_io.SparseModel, sel: FrameSelection,
         w2c = np.eye(4)
         w2c[:3, :3] = R
         w2c[:3, 3] = t
-        # 脸区软蒙版：468 地标凸包外扩 + 羽化
+        # 脸区软蒙版：地标轮廓外扩 + 羽化（hull=凸包 / oval=脸型轮廓多边形）
         pts = sel.px[name][:468].astype(np.int32)
-        hull = cv2.convexHull(pts.reshape(-1, 1, 2))
         cen = pts.mean(0)
-        hull_out = ((hull[:, 0, :] - cen) * cfg.hull_margin + cen).astype(np.int32)
         m = np.zeros((h, w), np.uint8)
-        cv2.fillConvexPoly(m, hull_out, 255)
+        if cfg.mask_shape == "oval":
+            from .calibrate import FACE_OVAL
+            poly = (pts[list(FACE_OVAL)] - cen) * cfg.hull_margin + cen
+            cv2.fillPoly(m, [poly.astype(np.int32)], 255)
+        else:
+            hull = cv2.convexHull(pts.reshape(-1, 1, 2))
+            hull_out = ((hull[:, 0, :] - cen) * cfg.hull_margin + cen).astype(np.int32)
+            cv2.fillConvexPoly(m, hull_out, 255)
         m = cv2.GaussianBlur(m, (0, 0), cfg.feather_px / 2.5)
         views.append(View(name=name, w2c=w2c, K=Kf,
                           img=cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0,
@@ -185,8 +194,10 @@ def train_base(views: list[View], init_ply: str | Path,
     strategy.check_sanity(params, optimizers)
     state = strategy.initialize_state(scene_scale=extent * 1.1)
 
-    imgs = torch.stack([torch.tensor(v.img, device="cuda") for v in train])
-    masks = torch.stack([torch.tensor(v.mask, device="cuda") for v in train])
+    # 训练帧存 CPU（pinned）按步上传：1080p × 百帧量级时全量进显存会 OOM
+    # （114 帧 × 1920×1080×3×4B ≈ 2.8GB），单帧 H2D ≈ 数 ms 可忽略
+    imgs = torch.stack([torch.tensor(v.img).pin_memory() for v in train])
+    masks = torch.stack([torch.tensor(v.mask).pin_memory() for v in train])
     w2cs = torch.tensor(np.stack([v.w2c for v in train]), dtype=torch.float32, device="cuda")
     Ks = torch.tensor(np.stack([v.K for v in train]), dtype=torch.float32, device="cuda")
     H, W = train[0].img.shape[:2]
@@ -202,8 +213,8 @@ def train_base(views: list[View], init_ply: str | Path,
             rasterize_mode="antialiased" if cfg.antialiased else "classic",
             packed=False, absgrad=True, backgrounds=torch.zeros(1, 3, device="cuda"))
         info["means2d"].retain_grad()
-        gt = imgs[ci].permute(2, 0, 1)
-        mw = masks[ci][None]
+        gt = imgs[ci].to("cuda", non_blocking=True).permute(2, 0, 1)
+        mw = masks[ci].to("cuda", non_blocking=True)[None]
         loss = ((renders[0].permute(2, 0, 1) - gt).abs().mean(0) * mw).sum() / mw.sum()
         loss = loss + cfg.ssim_weight * (1 - _ssim(renders[0].permute(2, 0, 1) * mw, gt * mw))
         strategy.step_pre_backward(params, optimizers, state, step, info)

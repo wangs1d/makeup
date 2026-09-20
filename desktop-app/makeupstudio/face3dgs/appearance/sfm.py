@@ -59,6 +59,24 @@ def extract_frames(video: str | Path, images_dir: str | Path,
     return n
 
 
+def _pycolmap_call(fn, **kw):
+    """pycolmap 版本兼容：4.x 把 db_path 更名为 database_path，其余同名。"""
+    try:
+        return fn(**kw)
+    except TypeError:
+        renamed = {("database_path" if k == "db_path" else k): v
+                   for k, v in kw.items()}
+        if renamed == kw:
+            raise
+        return fn(**renamed)
+
+
+def _num_registered(rec) -> int:
+    if hasattr(rec, "num_reg_images"):
+        return int(rec.num_reg_images())
+    return len(rec.images)
+
+
 def run_sfm(images_dir: str | Path, project_dir: str | Path,
             on_progress: ProgressCB | None = None) -> SfmResult:
     """图像目录 → 增量 SfM → 最大子模型。依赖 pycolmap（pip install pycolmap）。"""
@@ -80,22 +98,24 @@ def run_sfm(images_dir: str | Path, project_dir: str | Path,
     sparse_out.mkdir(parents=True)
 
     cb(0.2, "特征提取…")
-    pycolmap.extract_features(db_path=db, image_path=images_dir,
-                              camera_mode=pycolmap.CameraMode.SINGLE)
+    _pycolmap_call(pycolmap.extract_features, db_path=db, image_path=images_dir,
+                   camera_mode=pycolmap.CameraMode.SINGLE)
     cb(0.5, "特征匹配…")
-    pycolmap.match_exhaustive(db_path=db)
+    _pycolmap_call(pycolmap.match_exhaustive, db_path=db)
     cb(0.7, "增量重建…")
-    maps = pycolmap.incremental_mapping(db_path=db, image_path=images_dir,
-                                        output_path=sparse_out)
+    _pycolmap_call(pycolmap.incremental_mapping, db_path=db,
+                   image_path=images_dir, output_path=sparse_out)
 
     best, best_n = None, -1
     for d in sorted(sparse_out.glob("[0-9]*")):
         rec = pycolmap.Reconstruction(d)
-        if rec.num_reg_images() >= 5 and rec.num_reg_images() > best_n:
-            best, best_n = d, rec.num_reg_images()
+        n = _num_registered(rec)
+        if n >= 5 and n > best_n:
+            best, best_n = d, n
     if best is None:
         raise RuntimeError("SfM 无可用子模型（≥5 张配准）；检查采集质量/光照")
     cb(1.0, f"SfM 子模型 {best.name}：{best_n} 张配准")
     return SfmResult(images_dir=images_dir, sparse_dir=best,
-                     frames=len(list(images_dir.glob("*.jpg"))),
+                     frames=len(list(images_dir.glob("*.jpg")))
+                     + len(list(images_dir.glob("*.png"))),
                      registered=best_n)

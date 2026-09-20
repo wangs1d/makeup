@@ -98,7 +98,18 @@ def main() -> int:
 
     run_photoreal(args.project, args.sfm, args.init, spec, args.out,
                   train_cfg=cfg, tex=args.tex, intensity=args.intensity,
-                  reuse_base=not args.no_reuse_base, progress=cb)
+                  reuse_base=not args.no_reuse_base, reference=args.reference,
+                  progress=cb)
+    report_path = Path(args.out) / "report.json"
+    if report_path.exists():
+        rep = json.loads(report_path.read_text(encoding="utf-8"))
+        q, gate = rep.get("quality") or {}, rep.get("fidelity_gate") or {}
+        print(f"[quality] 分级 {q.get('grade')}（短边 {q.get('min_side')}px / "
+              f"PSNR {q.get('psnr')}dB / {q.get('splats')} splats）"
+              + ("；" + "；".join(q.get("reasons", [])) if q.get("reasons") else ""))
+        print(f"[fidelity] ΔE00 mean={rep.get('makeup_delta_e', {}).get('_mean', 'n/a')} "
+              f"gate={gate.get('status')}"
+              + (f" 超预算区域={gate.get('over')}" if gate.get("over") else ""))
     return 0
 
 

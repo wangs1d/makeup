@@ -257,6 +257,48 @@ def calibrate_spec(template: dict, ref_bgr: np.ndarray,
 
 # ---------------- 还原度度量（渲染帧 vs spec） ----------------
 
+# 验收门（ΔE00 预算）：文档路线图"超阈值自动降级/重标定"的落地。
+# 唇是妆面核心 SKU 且色度强，预算更紧；未列出的区域用默认预算。
+FIDELITY_BUDGET = {"lipstick": 12.0}
+FIDELITY_BUDGET_DEFAULT = 14.0
+FIDELITY_RETRY_BOOST = 1.25      # 超预算区域 opacity 提升系数（重烘一次）
+
+
+def fidelity_gate(delta_e: dict, budget: dict | None = None
+                  ) -> dict[str, object]:
+    """逐区域 ΔE00 vs 预算 → {"status": passed|over, "over": [region...]}。
+
+    delta_e 空（无妆区可评）视为 passed——门只对"有度量"的区域生效。"""
+    bud = dict(FIDELITY_BUDGET)
+    if budget:
+        bud.update(budget)
+    over = []
+    for region, v in (delta_e or {}).items():
+        if region.startswith("_"):
+            continue
+        if v > bud.get(region, FIDELITY_BUDGET_DEFAULT):
+            over.append(region)
+    return {"status": "passed" if not over else "over", "over": over,
+            "budget": {k: bud.get(k, FIDELITY_BUDGET_DEFAULT)
+                       for k in (delta_e or {}) if not k.startswith("_")}}
+
+
+def boost_spec_regions(spec: dict, regions: list[str],
+                       factor: float = FIDELITY_RETRY_BOOST) -> dict:
+    """超预算区域 opacity 上调（封顶 1.0）——还原度自动重标定的单步动作。
+
+    只动浓度不动颜色：色差偏大通常因为 pigment-safe 迁移被"过度保守"，
+    提浓度直接缩小 ΔE；改颜色反而破坏已标定的目标色语义。"""
+    import copy
+
+    out = copy.deepcopy(spec)
+    for layer in out.get("layers", []):
+        if layer.get("region") in regions:
+            layer["opacity"] = float(min(1.0,
+                                         float(layer.get("opacity", 0.7)) * factor))
+    return out
+
+
 def spec_targets(spec: dict) -> dict[str, np.ndarray]:
     """spec → region → 目标 Lab（色带两端均值，即烘焙语义的"妆后目标色"）。"""
     targets: dict[str, np.ndarray] = {}
@@ -270,6 +312,29 @@ def spec_targets(spec: dict) -> dict[str, np.ndarray]:
         rgb_mean = np.clip(rgbs.mean(0), 0, 1)
         targets[layer["region"]] = rgb2lab(rgb_mean[None, :])[0]
     return targets
+
+
+# 图像空间区域蒙版互相包含：foundation 是整脸椭圆（含五官），直接度量的
+# "底妆区"会把眼影/唇/眉像素算进去，ΔE 被特征色拉爆（实测全区域假性超预算）。
+# 度量前把这些特征妆区从底妆区中扣除。
+FOUNDATION_EXCLUDE = ("lipstick", "eyeshadow", "eyebrow", "eyeliner")
+
+
+def exclude_region_overlap(masks: dict[str, np.ndarray],
+                           base: str = "foundation",
+                           exclude: tuple[str, ...] = FOUNDATION_EXCLUDE
+                           ) -> dict[str, np.ndarray]:
+    """返回扣除特征妆区后的蒙版组（不改输入）。非 base 区域原样透传。"""
+    out = dict(masks)
+    if base not in out:
+        return out
+    acc = None
+    for r in exclude:
+        if r in out:
+            acc = out[r] if acc is None else np.maximum(acc, out[r])
+    if acc is not None:
+        out[base] = np.clip(out[base] - acc, 0.0, 1.0)
+    return out
 
 
 def region_delta_e(img_rgb: np.ndarray, masks: dict[str, np.ndarray],
