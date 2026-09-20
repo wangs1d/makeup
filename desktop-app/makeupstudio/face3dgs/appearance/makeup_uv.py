@@ -30,6 +30,17 @@ FINISH_TARGET = {   # finish → (rough, coat, sheen)
 }
 SKIN_ROUGH = 0.52
 MAP_KEYS = ("rough", "coat", "sss", "sheen")
+# P3 边界羽化场下限：边界带内 kL/chroma 收到下限（颜料羽化=只轻微染色），
+# 内部才回到全量。线条区（feather=0）不参与，避免 1-3px 的眼线被削弱。
+EDGE_KL_FLOOR = 0.30
+EDGE_CH_FLOOR = 0.55
+# P3 SH 分区阈值：壳层迁移后颜色与底模素颜色的 Lab 距离（ΔE*ab）超过该值
+# 视为"强色层"（唇/眼线/睫毛/眉），sh_rest 置零——妆色是视角无关的颜料，
+# 不该被底模素颜的 SH 残差调制；低于该值的低饱和层（底妆/腮红/修容/高光）
+# 与皮肤同源，继承底模 SH 残差只换 DC 唯色，掠射角明度与素颜连续，消除
+# "壳层亮/皮肤暗"的光照跳变。25 Lab 单位 ≈ 肉眼明显的色差（底妆 ~3、
+# 修容 ~10、腮红 ~15、唇/眼线/眉 40+）。
+SH_SAT_THRESHOLD = 25.0
 
 
 # ---------------- 颜色空间（float 精度 Lab，D65） ----------------
@@ -147,6 +158,61 @@ class UvMakeupMaps:
             channels={k: np.zeros((tex, tex), np.float32) for k in MAP_KEYS})
 
 
+# ---------------- 数据驱动妆区场（P1 定位 / P2 颜色） ----------------
+# 根因：妆区（涂在哪）来自 canonical 模板带 + 三角化地标（几何先验，唇/眼线
+# 等小高频区有 ~2% 系统错位），妆色（什么色）来自 PHOTOREAL_LAB 手工系数
+# （"期待"而非观测）。ZoneFields 把这两条换成观测：位置来自语义分割的
+# 多视角投票，颜色来自参考图像素，系数由最小二乘自求解——模板/地标全部
+# 降级为兜底（四级回退），每级在 report 留痕。
+
+@dataclass
+class ZoneSpec:
+    """单区域的观测妆区场。
+
+    p       (n,) 逐 splat 语义概率（多视角分割投票聚合，0..1）
+    mode    replace  观测定义边界（唇/眉：模板在这些小高频区会整带错位）；
+            multiply 地标/模板给形状先验，观测只收边界与漏涂（眼影/眼线/底妆）
+    scale   该层 opacity × intensity（语义概率 → 妆权重同浓度语义）
+    trust   多视角一致性置信度 0..1；0 = 不可信（完全回退几何先验）
+    fallback_ratio  兜底权重上限（分割缺席处不留黑洞，也不把错位补回来）
+    level   来源层级标签进 report（multiview_seg > single_seg > landmark_band
+            > uv_template）
+    """
+    p: np.ndarray
+    mode: str = "multiply"
+    scale: float = 1.0
+    trust: float = 1.0
+    fallback_ratio: float = 0.25
+    level: str = "multiview_seg"
+
+
+@dataclass
+class ZoneFields:
+    """P1/P2 观测场集合：语义概率（涂在哪）+ 参考色（什么色）+ 自求解系数。
+
+    color/coeffs 均为可选：缺席时该区域沿用 UV 目标场与 PHOTOREAL_LAB。"""
+    seg: dict[str, "ZoneSpec"] = field(default_factory=dict)
+    color: dict[str, np.ndarray] = field(default_factory=dict)   # region → (n,3) 参考色
+    coeffs: dict[str, tuple[float, float]] = field(default_factory=dict)  # region → (kL, chroma)
+
+    def empty(self) -> bool:
+        return not (self.seg or self.color or self.coeffs)
+
+
+def _edge_ramp(cov: np.ndarray, feather_px: float) -> np.ndarray:
+    """P3 边界羽化场：区域边界内 feather/2 距离上 0→1 平滑步进（内部=1）。
+
+    w 的衰减本就由核心的距离整形给出；本场是给 kL/chroma 用的"颜料羽化"
+    语义——真实化妆品在边界带只轻微染色，内部才全量。feather=0（眉/眼线/
+    睫毛等线条区）返回全 1，不削弱 1-3px 的细线。"""
+    band = float(feather_px) * 0.5
+    if band <= 0.5:
+        return np.ones(cov.shape, np.float32)
+    d = cv2.distanceTransform((cov > 0.5).astype(np.uint8), cv2.DIST_L2, 3)
+    s = np.clip(d / band, 0.0, 1.0)
+    return (s * s * (3.0 - 2.0 * s)).astype(np.float32)
+
+
 def _value_noise(tex: int, cell: int, rng: np.random.Generator,
                  octaves: int = 3, gain: float = 0.5) -> np.ndarray:
     """多倍频 value noise (tex,tex) 0..1（唇纹/粉感的微观调制源）。"""
@@ -224,6 +290,18 @@ class UvMakeupBaker:
         return self._fitter
 
     # ---------- 唇红带 3D 拓扑 → UV 光栅化 ----------
+
+    def _feather_px(self, region: str, shape: dict | None) -> float:
+        """该区域的羽化宽度（texel）——与核心 RegionMasks 同表同公式。
+
+        core.feather_px 读模块级 TEX，而 bake 期间 TEX 已切到 self.tex，
+        因此这里拿到的是当前贴图分辨率下的真实像素宽度。"""
+        core = _load_core()
+        falloff = float((shape or {}).get("falloff", 0.65) or 0.65)
+        try:
+            return float(core.feather_px(region, shape or {}, falloff))
+        except Exception:                          # 核心表缺该区域：不做羽化
+            return 0.0
 
     def raster_lip_band(self) -> tuple[np.ndarray, np.ndarray]:
         """唇红带 (cov, cent) 光栅化到 UV。来自 canonical 网格的带三角 +
@@ -318,6 +396,14 @@ class UvMakeupBaker:
                     if peak < 1e-4:
                         continue
                     cov = np.clip(cov / peak, 0, 1)
+                # P3 咬唇/晕染：gradation（形状参数）落成真实边界羽化——核心
+                # feather_px 只认 blur，gradation 此前在 UV 路径完全没生效
+                grad = float(np.clip(float(shape.get("gradation", 0.0) or 0.0), 0.0, 1.0))
+                if grad > 0.01 and region == "lipstick":
+                    cov = cv2.GaussianBlur(cov, (0, 0), grad * 0.02 * self.tex)
+                # P3 边界羽化场：带内距离整形 → 边界处只轻微染色，内部才全量
+                # （ramp 乘进 kL/chroma 场；线条区 feather=0 → ramp≡1 不削弱）
+                ramp = _edge_ramp(cov, self._feather_px(region, shape))
                 w = np.clip(cov * opacity, 0, 1)[..., None]
                 col = np.clip(core.sample_ramp(
                     stops, np.clip(cent, 0, 1)), 0, 1).astype(np.float32)
@@ -345,15 +431,21 @@ class UvMakeupBaker:
                     maps.albedo[upd] = tgt[upd]
                     maps.w = np.maximum(maps.w, w[..., 0])
                     kL_t, chroma_t = PHOTOREAL_LAB.get(region, (0.25, 1.0))
-                    maps.kL[upd] = kL_t
-                    maps.chroma[upd] = chroma_t
+                    # P3：边界带内 kL 从 EDGE_KL_FLOOR 渐入（内部才全量），
+                    # chroma 同步轻收——避免"明度不动但满色度"的彩色硬边
+                    kL_f = (kL_t * (EDGE_KL_FLOOR + (1 - EDGE_KL_FLOOR) * ramp)
+                            ).astype(np.float32)
+                    ch_f = (chroma_t * (EDGE_CH_FLOOR + (1 - EDGE_CH_FLOOR) * ramp)
+                            ).astype(np.float32)
+                    maps.kL[upd] = kL_f[upd]
+                    maps.chroma[upd] = ch_f[upd]
                     # 逐层字段（序列合成用）：真实上妆是"底妆先改肤色，腮红
                     # 再叠加在其上"——"w 大者胜"的单层融合会把腮红/修容/高光
-                    # 整体压没（底妆 w 恒大于特征层），像素渲染端按层链合成
+                    # 整体压没（底妆 w 恒大于特征层），像素渲染端按层链合成。
+                    # kL/chroma 存场（非标量）：羽化场随层链一并进入像素路径
                     maps.layer_fields.append({
                         "region": region, "w": w[..., 0].copy(),
-                        "tgt": tgt.copy(), "kL": float(kL_t),
-                        "chroma": float(chroma_t)})
+                        "tgt": tgt.copy(), "kL": kL_f, "chroma": ch_f})
                     # 微观粗糙度：粉状加橘皮（唇釉材质由 3D 路径在 apply 时覆盖）
                     ch = maps.channels
                     ch["rough"][upd] = (rough_t + (micro[upd] - 0.5)
@@ -532,6 +624,7 @@ class UvMakeupBaker:
                        intensity: float = 0.8,
                        near: np.ndarray | None = None,
                        bands3d: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+                       zones: "ZoneFields | None" = None,
                        ) -> dict[str, np.ndarray]:
         """UV 目标场 → per-splat 颜色（Lab 部分迁移，保纹理）+ 材质通道。
 
@@ -541,17 +634,38 @@ class UvMakeupBaker:
         near：(n,) splat 到 canonical 表面的距离（bind_uv 产物）——边界软门控，
         UV 归属在鼻翼/眼角/轮廓处的误差按距离衰减妆权重，收掉边界晕。
         bands3d：{"eyeliner"/"lashes"/"eyebrow": (w, cent)} —— `landmark_band_3d`
-        的观测锚定带，覆盖同区域 UV 模板权重（颜色仍取 UV 场，带只改"涂在哪"）。"""
+        的观测锚定带，覆盖同区域 UV 模板权重（颜色仍取 UV 场，带只改"涂在哪"）。
+        zones：P1/P2 观测妆区场（语义概率/参考色/自求解系数）——优先级高于
+        以上全部几何路径，见 `_apply_zones` 的四级回退语义。"""
         # —— _bilinear 内部按全局 TEX 钳制坐标，采样 2048 图前必须切全局尺寸 ——
         core = _load_core()
         prev_tex = core.TEX
         core.set_texture_size(maps.tex)
         try:
             out = self._apply_locked(cloud, maps, uv, valid, treatment, core,
-                                     lip3d, near, bands3d)
+                                     lip3d, near, bands3d, zones)
         finally:
             core.set_texture_size(prev_tex)
         return out
+
+    def assignment(self, cloud: dict[str, np.ndarray], maps: UvMakeupMaps,
+                   uv: np.ndarray, valid: np.ndarray,
+                   lip3d: tuple[np.ndarray, np.ndarray] | None = None,
+                   near: np.ndarray | None = None,
+                   bands3d: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+                   zones: "ZoneFields | None" = None) -> dict:
+        """逐 splat 指派的公开入口（自带 TEX 切换）。
+
+        与壳层/图集路径共用同一 `_assignment`；zones=None 时返回的即纯几何
+        兜底（四级回退的 level 3/4），可作语义观测妆区的 IoU 参照系。"""
+        core = _load_core()
+        prev_tex = core.TEX
+        core.set_texture_size(maps.tex)
+        try:
+            return self._assignment(cloud, maps, uv, valid, core, lip3d, near,
+                                    bands3d, zones)
+        finally:
+            core.set_texture_size(prev_tex)
 
     @staticmethod
     def _base_micro_hp(cloud: dict[str, np.ndarray], t: int,
@@ -601,7 +715,8 @@ class UvMakeupBaker:
         hp = np.clip(hp / scale, -1.0, 1.0)
         return hp[tyi, ti]
 
-    def _assignment(self, cloud, maps, uv, valid, core, lip3d, near, bands3d) -> dict:
+    def _assignment(self, cloud, maps, uv, valid, core, lip3d, near, bands3d,
+                    zones: "ZoneFields | None" = None) -> dict:
         """逐 splat 妆容指派：权重（全部门控后）+ 目标色 + 材质通道。
 
         原位重染色（_apply_locked）与独立壳层（build_makeup_layer）共用同一
@@ -696,6 +811,19 @@ class UvMakeupBaker:
         else:
             cent_out = np.zeros(len(w), np.float32)
 
+        # ---- P1/P2 观测妆区场：语义概率（涂在哪）+ 参考色（什么色）+ 系数 ----
+        # 在全部几何兜底（UV 模板 → 3D 地标带 → 唇带）算完之后覆盖：观测
+        # 永远优先于几何先验，几何只在观测缺席/不可信时按四级回退兜底。
+        # 观测场可传 ZoneFields 本身，也可传带 .fields 的容器（semantics.
+        # ObservedZones——pipeline 需要同时携带 report 留痕）。
+        zf = getattr(zones, "fields", zones)
+        if zf is not None and not zf.empty():
+            cent_uv = (smp(maps.lip_cent).astype(np.float32)
+                       if getattr(maps, "lip_cent", None) is not None else None)
+            w, tgt, kL, chroma, cent_out, lip_zone = self._apply_zones(
+                zf, w, tgt, kL, chroma, cent_out, lip_zone, cent_uv,
+                gate, gate_anch, valid)
+
         cur = np.clip(np.asarray(cloud["rgba"], np.float64)[:, :3], 0, 1)
         rough_raw = smp(maps.channels["rough"]).astype(np.float32)
         coat_raw = smp(maps.channels["coat"]).astype(np.float32)
@@ -725,6 +853,72 @@ class UvMakeupBaker:
                 "sss_raw": sss_raw, "sheen_raw": sheen_raw,
                 "rough": rough_f.astype(np.float32), "coat": coat_f.astype(np.float32),
                 "sss": sss_f.astype(np.float32), "sheen": sheen_f.astype(np.float32)}
+
+    @staticmethod
+    def _apply_zones(zones: "ZoneFields", w: np.ndarray, tgt: np.ndarray,
+                     kL: np.ndarray, chroma: np.ndarray, cent_out: np.ndarray,
+                     lip_zone: np.ndarray | None, cent_uv: np.ndarray | None,
+                     gate: np.ndarray, gate_anch: np.ndarray,
+                     valid: np.ndarray) -> tuple:
+        """观测妆区场 → 覆盖几何兜底的 权重 / 目标色 / 迁移系数 / 唇区。
+
+        四级回退语义（report 里逐区域记来源）：
+            multiview_seg（多视角投票）/ single_seg（单图分割）可信时按 mode
+            定义边界或收边；不可信（trust=0）或观测缺席处保留几何兜底，但
+            兜底幅度受 fallback_ratio 限制——否则模板 ~2% 的系统错位又被补回。
+        mode：
+            replace  观测即边界（唇/眉）：w = trust·(p·scale) + (1-trust)·w
+                     + trust·fr·w·(1-p)（p 缺席处才吃兜底）
+            multiply 地标/模板给形状，观测收边界与漏涂：w × (fr + (1-fr)·trust·p)
+
+        lip_zone 命中时返回合并后的唇掩码——语义唇可能超出 3D 唇带，唇部
+        材质（gloss/sss）要跟着走；带外 splat 的渐变坐标用 UV 兜底唇带的
+        向心度补（3D 带外 cent≡0 会把它们压到色带最暗端）。"""
+        n = len(w)
+        valid = np.asarray(valid, bool)
+        for region, zs in zones.seg.items():
+            p = np.clip(np.asarray(zs.p, np.float32), 0.0, 1.0).copy()
+            p[~valid] = 0.0
+            # 3D 锚定级别的区域用 gate_anch（观测地标/分割背书），其余用 gate
+            p = p * (gate_anch if region in ("lipstick", "eyeliner", "lashes",
+                                             "eyebrow") else gate)
+            t = float(np.clip(zs.trust, 0.0, 1.0))
+            fr = float(np.clip(zs.fallback_ratio, 0.0, 1.0))
+            if zs.mode == "replace":
+                w_sem = np.clip(p * float(zs.scale), 0.0, 1.0)
+                w = np.clip(t * w_sem + (1.0 - t) * w + t * fr * w * (1.0 - p),
+                            0.0, 1.0)
+            else:
+                w = w * (fr + (1.0 - fr) * np.clip(t * p + (1.0 - t), 0.0, 1.0))
+            if region == "lipstick":
+                base = (lip_zone if lip_zone is not None
+                        else np.zeros(n, bool))
+                lip_zone = base | (p > 0.02)
+                if cent_uv is not None:
+                    cent_out = np.where((p > 0.02) & (np.abs(cent_out) < 1e-6),
+                                        cent_uv, cent_out)
+        # 参考驱动的目标色 / 迁移系数（P2）：不依赖语义分割——有分割时按观测
+        # 妆区生效，没有分割时按几何兜底妆区（w）生效，因此"颜色从参考来"
+        # 在 face-parsing 缺席时同样成立。
+        for region in sorted(set(zones.color) | set(zones.coeffs)):
+            zs = zones.seg.get(region)
+            if zs is not None:
+                p = np.clip(np.asarray(zs.p, np.float32), 0.0, 1.0).copy()
+                p[~valid] = 0.0
+                p = p * (gate_anch if region in ("lipstick", "eyeliner",
+                                                 "lashes", "eyebrow") else gate)
+                upd = (p > 0.02) & (w > 0.02)
+            else:
+                upd = w > 0.02
+            col = zones.color.get(region)
+            if col is not None:
+                tgt = np.where(upd[:, None],
+                               np.clip(np.asarray(col, np.float32), 0, 1), tgt)
+            co = zones.coeffs.get(region)
+            if co is not None:
+                kL = np.where(upd, float(co[0]), kL)
+                chroma = np.where(upd, float(co[1]), chroma)
+        return w, tgt, kL, chroma, cent_out, lip_zone
 
     @staticmethod
     def _lab_migrate(cur: np.ndarray, tgt: np.ndarray, kL: np.ndarray,
@@ -758,8 +952,9 @@ class UvMakeupBaker:
             [new_L, new_ab[:, 0], new_ab[:, 1]], axis=1)).astype(np.float32)
 
     def _apply_locked(self, cloud, maps, uv, valid, treatment, core, lip3d,
-                      near, bands3d) -> dict:
-        a = self._assignment(cloud, maps, uv, valid, core, lip3d, near, bands3d)
+                      near, bands3d, zones=None) -> dict:
+        a = self._assignment(cloud, maps, uv, valid, core, lip3d, near, bands3d,
+                             zones)
         w, tgt, cur = a["w"], a["tgt"], a["cur"]
         out = {}
         for k, v in cloud.items():
@@ -804,10 +999,13 @@ class UvMakeupBaker:
                            lip3d: tuple[np.ndarray, np.ndarray] | None = None,
                            near: np.ndarray | None = None,
                            bands3d: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+                           zones: "ZoneFields | None" = None,
                            min_w: float = 0.05, scale_ratio: float = 1.0,
                            opacity_gain: float = 1.0,
                            normal_offset: float = 0.15,
                            hp_gain: float = 0.10,
+                           sh_partition: bool = True,
+                           sh_sat_threshold: float = SH_SAT_THRESHOLD,
                            ) -> tuple[dict[str, np.ndarray], np.ndarray]:
         """妆容壳层 = 真实高斯球：逐个对应底模 splat 生成一层重叠新高斯。
 
@@ -825,15 +1023,19 @@ class UvMakeupBaker:
                       场只是程序噪声，真实微观质感的第一来源是底模本身）；
             opacity   w × 底模 opacity × opacity_gain（壳层堆叠比例与底模
                       一致，妆强 ≈ w）；
-            sh_rest   置零（妆色视角无关，不被底模素颜 SH 残差调制；视角
-                      相关高光由渲染端 material AOV 合成补回）；
+            sh_rest   按区域饱和度分区（P3）：低饱和层（底妆/腮红/修容/高光）
+                      继承底模 SH 残差，只换 DC 唯色——掠射角明度与素颜皮肤
+                      连续，不再出现"壳层亮/皮肤暗"的光照跳变；强色层（唇/
+                      眼线/睫毛/眉）置零（妆色视角无关，不被素颜 SH 调制，
+                      视角相关高光由渲染端 material AOV 合成补回）。
             material  finish 全强度（唇釉清漆/sss/珠光直接挂在壳层上）。
         返回 (layer_cloud, src_idx)；`merge_makeup_layer` 合并进底模导出。"""
         core = _load_core()
         prev_tex = core.TEX
         core.set_texture_size(maps.tex)
         try:
-            a = self._assignment(cloud, maps, uv, valid, core, lip3d, near, bands3d)
+            a = self._assignment(cloud, maps, uv, valid, core, lip3d, near,
+                                 bands3d, zones)
         finally:
             core.set_texture_size(prev_tex)
 
@@ -880,8 +1082,17 @@ class UvMakeupBaker:
         layer["shin"] = rough_to_shin(a["rough"][idx]).astype(np.float32)
         sh = cloud.get("sh_rest")
         if sh is not None:
-            layer["sh_rest"] = np.zeros((len(idx), np.asarray(sh).shape[1], 3),
-                                        np.float32)
+            sh = np.asarray(sh)
+            sh_l = np.zeros((len(idx), sh.shape[1], 3), np.float32)
+            if sh_partition and len(idx):
+                # P3 SH 分区：按壳层色相对素颜的偏离量自动选——低饱和层（底妆/
+                # 腮红/修容/高光）与皮肤同源，继承底模 SH 残差只换 DC 唯色；
+                # 强色层（唇/眼线/睫毛/眉）是视角无关颜料，sh_rest 保持零。
+                dev = np.linalg.norm(rgb2lab(col[idx]) - rgb2lab(a["cur"][idx]),
+                                     axis=1)
+                soft = dev <= float(sh_sat_threshold)
+                sh_l[soft] = sh[idx][soft]
+            layer["sh_rest"] = sh_l
         return layer, idx
 
 

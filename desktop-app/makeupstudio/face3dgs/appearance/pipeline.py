@@ -23,7 +23,7 @@ import numpy as np
 from .. import colmap_io
 from ..splat_io import read_ply
 from ...tracker import FaceTracker
-from ..fit_makeup import FaceMakeupFitter
+from ..fit_makeup import FaceMakeupFitter, _load_core
 from . import train_base as tb
 from .frames import FrameSelection, select_frames
 from .makeup_pack import compose_pack
@@ -219,12 +219,119 @@ def build_asset(project_dir: str | Path, sfm_dir: str | Path,
     return cloud, sel, landmarks, model, train_report
 
 
+def build_asset_from_image(image: str | Path, out_dir: str | Path,
+                           spec: dict | None = None,
+                           ply: str | Path | None = None,
+                           template: str | Path | None = None,
+                           tex: int = 2048, intensity: float = 0.8,
+                           reference: str | Path | None = None,
+                           progress: ProgressCB | None = None
+                           ) -> tuple[dict, np.ndarray, dict]:
+    """单图入口（P4）：一张照片 → canonical 3DGS 资产 →（可选）上妆。
+
+    与视频链路的差别只在"底模怎么来"——LAM（aigc3d，SIGGRAPH 2025）从单张正面照
+    回归 canonical 高斯，report 标 base_source="LAM"；语义妆区只有一帧观测，落到
+    single_seg 级。其余（UV 绑定 / 妆容目标场 / 壳层 / 材质 / 离线渲染）完全复用：
+    lam_adapter 把 canonical 468 地标配准到点云同帧并落 landmarks.npy，bind_uv 的
+    register() 残差 ≈ 0，管线不需要为单图入口开分支。
+
+    产物布局与 build_asset 一致（base.ply + landmarks.npy + asset_report.json，
+    上妆时再加 madeup.ply/.splat/material.*），因此 makeup / render 子命令照常可用。
+    ply 给定时跳过 LAM 推理（用已有产物复跑上妆，便于离线调试）；环境不完整时抛
+    RuntimeError（消息即操作指引），视频主链路不受影响。"""
+    from . import lam_adapter as lam
+
+    cb = progress or (lambda *a: None)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if ply is None:
+        st = lam.status()
+        if not st.ok:
+            raise RuntimeError(f"LAM 环境不完整：{st.missing_hint}"
+                               "（视频链路不受影响："
+                               "face3dgs asset -v 视频 -p 工程）")
+        cb("lam", 0.1, "LAM 单图推理（canonical 高斯）…")
+        ply = lam.predict(image, out_dir / "lam")
+    cb("lam", 0.4, f"读取 canonical 高斯：{Path(ply).name}")
+    cloud, landmarks, info = lam.load_canonical(ply, out_dir / "landmarks.npy",
+                                               path=template)
+    cb("lam", 0.6, f"canonical 地标配准 rmse={info['landmarks_rmse']:.4f}"
+                   f"（scale={info['scale']:.3f}）")
+    from ..splat_io import export_splat, write_ply
+    write_ply(cloud, out_dir / "base.ply")
+
+    report: dict = {
+        "base_source": "LAM", "frames_selected": 1, "frames_rejected": 0,
+        "ref_frame": Path(image).name, "splats": int(len(cloud["xyz"])),
+        "uv_tex": tex, "lam": {**info, "ply": str(ply), "repo": str(lam.REPO_DIR)},
+        "honesty": "LAM 底模是单图回归的先验人脸，细节（毛孔/痣/发丝/牙齿）低于"
+                   "视频链路的光度重建；语义妆区只有单视角观测（single_seg）",
+        "makeup_zones": {}, "makeup_color_coeffs": {}, "color_profiles": {}}
+    if spec is None:
+        (out_dir / "asset_report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+        cb("lam", 1.0, f"资产完成 → {out_dir / 'base.ply'}")
+        return cloud, landmarks, report
+
+    layers = [l for l in spec.get("layers", []) if l.get("enabled", True)]
+    regions = tuple(dict.fromkeys(l.get("region") for l in layers
+                                  if l.get("region")))
+    region_scale: dict[str, float] = {}
+    for l in layers:
+        r = l.get("region")
+        if r:
+            region_scale[r] = max(region_scale.get(r, 0.0),
+                                  float(l.get("opacity", 0.7) or 0.7) * intensity)
+    try:
+        feather = {r: float(_load_core().feather_px(r, {}, 1.0))
+                   for r in ("lipstick", "eyebrow")}
+    except Exception:
+        feather = {}
+    zones = None
+    if regions:
+        try:
+            zones = lam.photo_zones(cloud, landmarks, image, regions,
+                                    region_scale=region_scale,
+                                    feather_px=feather, progress=cb)
+        except Exception as e:              # 观测失败不阻断（几何兜底照常上妆）
+            cb("lam", 0.7, f"照片语义观测失败（保持几何兜底）：{e}")
+
+    profiles: dict = {}
+    if reference and Path(reference).is_file():
+        profiles = _observe_color_profiles(reference, spec, cb)
+        if profiles:
+            spec = _spec_from_profiles(spec, profiles, cb)
+    color_report: dict = {}
+    made, coverage = apply_makeup_to_asset(
+        cloud, landmarks, spec, out_dir, tex=tex, intensity=intensity,
+        zones=zones, color_profiles=profiles, color_report=color_report,
+        progress=progress)
+    write_ply(made, out_dir / "madeup.ply")
+    export_splat(made, out_dir / "madeup.splat")
+    export_material(made, out_dir)
+    report.update({
+        "makeup_layer_splats": int((np.asarray(made["makeup_w"]) > 0.02).sum()),
+        "makeup_coverage": round(coverage, 4),
+        "layers": [l.get("id", l.get("region")) for l in layers],
+        "makeup_zones": zones.report if zones is not None else {},
+        "makeup_color_coeffs": color_report,
+        "color_profiles": {r: int(len(p[0])) for r, p in profiles.items()},
+    })
+    (out_dir / "asset_report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    cb("lam", 1.0, f"完成 → {out_dir / 'madeup.ply'}")
+    return cloud, landmarks, report
+
+
 def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
                           out_dir: str | Path, tex: int = 2048,
                           intensity: float = 0.8,
                           guidance: list[dict] | None = None,
                           as_layer: bool = True,
                           subdivide: bool = True,
+                          zones=None,
+                          color_profiles: dict | None = None,
+                          color_report: dict | None = None,
                           progress: ProgressCB | None = None) -> dict:
     """在 3DGS 资产上渲染妆容：UV 绑定 → 目标场合成 → 3D 锚定 → 烘焙导出。
 
@@ -242,7 +349,12 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
     canonical 模板在这些高频区域有 ~2% 系统错位，观测地标带优先、UV 蒙版兜底。
     guidance：_render_guidance_views 产物存在时，先聚合进 UV albedo
     （bake_guidance）重建壳层，再走 optimize_appearance 图像空间外观精修
-    （identity 锁以素颜底模为参考）。"""
+    （identity 锁以素颜底模为参考）。
+    zones：P1 观测妆区场（semantics.build_zones 产物）——语义观测优先于
+    3D 锚定带/UV 模板（四级回退），并在此回填 IoU 与几何级留痕。
+    color_profiles：P2 参考图 Lab 剖面（colorfield.extract_profiles 产物）——
+    在真实素颜底色上**最小二乘自求解**每区域迁移系数 (kL, chroma)，替代手工
+    PHOTOREAL_LAB 表（手工值降级为求解初值）；对照报告写进 color_report。"""
     cb = progress or (lambda *a: None)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -253,6 +365,15 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
     cb("makeup", 0.2, "UV 妆容目标场合成…")
     baker = UvMakeupBaker(tex=tex)
     maps = baker.bake(spec.get("layers", []), intensity=intensity)
+
+    if color_profiles:
+        # P2：参考剖面 × 真实素颜底色 → (kL, chroma) 最小二乘自求解
+        cb("makeup", 0.35, "参考驱动迁移系数自求解…")
+        zones, table = _solve_color_coeffs(cloud, maps, binding, zones,
+                                           color_profiles, cb)
+        if color_report is not None:
+            color_report.clear()
+            color_report.update(table)
 
     cb("makeup", 0.5, "3D 地标锚定（唇/眼线/睫毛/眉）…")
     layers = [l for l in spec.get("layers", []) if l.get("enabled", True)]
@@ -298,7 +419,8 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
         if as_layer:
             layer, src_idx = baker.build_makeup_layer(
                 cloud, m, binding.uv, binding.valid,
-                lip3d=lip3d, near=binding.near, bands3d=bands3d or None)
+                lip3d=lip3d, near=binding.near, bands3d=bands3d or None,
+                zones=zones)
             if len(src_idx):
                 # 薄层自检（分裂前：纯法线偏移语义）——壳层 splat 必须落在
                 # 对应底模 splat 的足迹内（偏移 ≤ 0.3×min_scale）
@@ -316,7 +438,7 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
             # 语义）——逐像素交付渲染与跨用户复用的数据源
             pack = compose_pack(baker, cloud, m, binding.uv, binding.valid,
                                 lip3d=lip3d, near=binding.near,
-                                bands3d=bands3d or None)
+                                bands3d=bands3d or None, zones=zones)
             if subdivide and len(src_idx):
                 n_before = len(src_idx)
                 layer, src_idx = subdivide_makeup_layer(
@@ -333,7 +455,30 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
             return made_m
         return baker.apply_to_cloud(cloud, m, binding.uv, binding.valid,
                                     lip3d=lip3d, intensity=intensity,
-                                    near=binding.near, bands3d=bands3d or None)
+                                    near=binding.near, bands3d=bands3d or None,
+                                    zones=zones)
+
+    if zones is not None and zones.fields and zones.fields.seg:
+        # 几何级留痕修正 + IoU 诊断：同一次 _assignment 关掉观测即纯几何兜底
+        # （level 3/4），语义观测妆区与它的 IoU 直接度量"数据驱动把模板挪了多远"。
+        from .semantics import iou as _zone_iou
+        geom = baker.assignment(cloud, maps, binding.uv, binding.valid,
+                                lip3d=lip3d, near=binding.near,
+                                bands3d=bands3d or None)
+        anchored = set(bands3d or {})
+        if lip3d is not None:
+            anchored.add("lipstick")
+        for rgn, rec in zones.report.items():
+            if rec.get("level") in ("uv_template", "landmark_band"):
+                rec["level"] = ("landmark_band" if rgn in anchored
+                                else "uv_template")
+            zs = zones.fields.seg.get(rgn)
+            if zs is not None:
+                rec["iou_vs_geometry"] = round(_zone_iou(
+                    np.asarray(zs.p) > 0.5, np.asarray(geom["w"]) > 0.05), 4)
+        cb("makeup", 0.62, "语义观测妆区 " + (zones.summary() or "（无）")
+           + " IoU=" + str({r: v.get("iou_vs_geometry") for r, v in
+                            zones.report.items() if v.get("iou_vs_geometry")}))
 
     cb("makeup", 0.65, "生成妆容壳层（near 软门控 + pigment-safe Lab 迁移）…")
     made = _bake_to_made(maps)
@@ -369,6 +514,45 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
     coverage = float(cov_mask.mean())
     cb("makeup", 1.0, f"妆区覆盖 {coverage:.3f}")
     return made, coverage
+
+
+def _solve_color_coeffs(cloud: dict, maps: UvMakeupMaps, binding, zones,
+                        profiles: dict, cb: ProgressCB):
+    """P2：参考图 Lab 剖面 × 真实素颜底色 → 逐区域 (kL, chroma) 自求解。
+
+    手工 PHOTOREAL_LAB 表在这里降级为"求解初值"：每个区域抽该妆区的 splat
+    （cur = 底模素颜色，tgt = 参考剖面在该 splat 向心度处的 Lab），最小二乘求
+    使迁移结果复现参考色的系数——消解 pigment-safe 阻尼（lab_adapt 最多收
+    0.6×）与系数被折叠的欠涂。解写进 zones.fields.coeffs（_apply_zones 消费），
+    返回 (zones, 逐区域对照报告)——报告进 report.json 的 makeup_color_coeffs。"""
+    from .colorfield import compare_coeffs, manual_coeff, pair_region_samples
+    from .makeup_uv import ZoneFields
+    from .semantics import ObservedZones
+
+    fields = zones.fields if zones is not None else ZoneFields()
+    table: dict[str, dict] = {}
+    for region, prof in profiles.items():
+        try:
+            pair = pair_region_samples(cloud, maps, binding.uv,
+                                       binding.valid, region, prof)
+        except Exception as e:              # 单区域失败不阻断其它区域
+            cb("makeup", 0.4, f"{region} 色彩场配对失败（沿用兜底系数）：{e}")
+            continue
+        if pair is None:
+            cb("makeup", 0.4, f"{region} 参考剖面未落到 splats（沿用兜底系数）")
+            continue
+        cur, tgt, w = pair
+        manual = manual_coeff(region)
+        rep = compare_coeffs(cur, tgt, w, manual=manual)
+        fields.coeffs[region] = (float(rep["solved"][0]), float(rep["solved"][1]))
+        rep["samples"] = int(len(cur))
+        table[region] = rep
+        cb("makeup", 0.45, f"{region} 系数 {tuple(manual)} → "
+                           f"{tuple(rep['solved'])}（ΔE00 {rep['delta_e_manual']}"
+                           f" → {rep['delta_e_solved']}，n={rep['samples']}）")
+    if table and zones is None:
+        zones = ObservedZones(fields=fields)
+    return zones, table
 
 
 def _render_guidance_views(cloud: dict, model: colmap_io.SparseModel,
@@ -498,15 +682,28 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
         guidance = _render_guidance_views(cloud, model, sel, out_dir, spec, cb)
         guidance_auto = guidance is not None
 
-    made, coverage = apply_makeup_to_asset(
-        cloud, landmarks, spec, out_dir, tex=tex,
-        intensity=intensity, guidance=guidance, progress=progress)
-
-    # ---- 预览（PBR + 妆感材质） ----
-    cb("export", 0.2, "素颜|妆后对比渲染…")
     images_dir = (project_dir / "capture" / "frames"
                   if (project_dir / "capture" / "frames").exists()
                   else project_dir / "images")
+
+    # ---- P1 语义观测妆区（face-parsing；不可用时优雅跳过，保持几何兜底） ----
+    zones = _observe_zones(cloud, model, sel, images_dir, spec, intensity, cb)
+
+    # ---- P2 参考驱动色彩场：参考图像素 Lab 剖面 → spec 多档色带 ----
+    profiles: dict = {}
+    if reference and Path(reference).is_file():
+        profiles = _observe_color_profiles(reference, spec, cb)
+        if profiles:
+            spec = _spec_from_profiles(spec, profiles, cb)
+
+    color_report: dict = {}
+    made, coverage = apply_makeup_to_asset(
+        cloud, landmarks, spec, out_dir, tex=tex, intensity=intensity,
+        guidance=guidance, zones=zones, color_profiles=profiles,
+        color_report=color_report, progress=progress)
+
+    # ---- 预览（PBR + 妆感材质） ----
+    cb("export", 0.2, "素颜|妆后对比渲染…")
     if not (out_dir / "light.bin").exists():
         # 复用旧底模（无 light.bin）：补估主光方向，保证 Unity 高光与烘焙光照同向
         cb("export", 0.1, "估计主光方向…")
@@ -522,14 +719,47 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
                                         if delta_e else "（无妆区可评）"))
     from .calibrate import FIDELITY_RETRY_BOOST, boost_spec_regions, fidelity_gate
     gate = fidelity_gate(delta_e)
-    if gate["status"] == "over" and reference and not guidance:
-        # 自动重标定：超预算区域提浓度重烘一次（颜色不动，浓度收差）
+    color_loop: list[dict] = []
+    if gate["status"] == "over" and profiles and not guidance:
+        # P2 小迭代环（≤2 轮）：求解 → 重烘 → 重测。实测妆区 Lab 与参考剖面的
+        # 残差反向过冲到目标色上（消解链路欠涂），重解系数后重烘再测。
+        for rnd in range(2):
+            measured = _measure_render_lab(sel, madeup_renders, images_dir,
+                                           tuple(profiles))
+            moved = _nudge_profiles(profiles, measured, cb)
+            if not moved:
+                break
+            cb("export", 0.55 + 0.05 * rnd, f"P2 闭环 {rnd + 1}/2："
+                                            "实测妆区 Lab 反向过冲重解系数…")
+            spec = _spec_from_profiles(spec, profiles, cb)
+            made, coverage = apply_makeup_to_asset(
+                cloud, landmarks, spec, out_dir, tex=tex, intensity=intensity,
+                zones=zones, color_profiles=profiles, color_report=color_report,
+                progress=progress)
+            previews, madeup_renders = _render_previews(model, sel, cloud, made,
+                                                        images_dir, out_dir)
+            delta_e = _delta_e_report(spec, sel, madeup_renders, images_dir)
+            retry = fidelity_gate(delta_e)
+            color_loop.append({"round": rnd + 1, "moved": sorted(moved),
+                               "delta_e": dict(delta_e),
+                               "over": retry["over"]})
+            cb("export", 0.6, f"闭环第 {rnd + 1} 轮后 ΔE00 "
+                              f"mean={delta_e.get('_mean', 'n/a')} "
+                              f"status={retry['status']}")
+            if retry["status"] == "passed":
+                break
+        final = fidelity_gate(delta_e)
+        gate = {"status": "loop_passed" if final["status"] == "passed"
+                else "degraded", "over": final["over"], "first": gate,
+                "loop": color_loop}
+    elif gate["status"] == "over" and reference and not guidance:
+        # 无参考剖面（仅参考图路径）：退回提浓度重烘一次（颜色不动，浓度收差）
         cb("export", 0.55, f"ΔE00 超预算 {gate['over']} → 重标定重烘"
                            f"（opacity ×{FIDELITY_RETRY_BOOST}）")
         spec = boost_spec_regions(spec, gate["over"])
         made, coverage = apply_makeup_to_asset(
             cloud, landmarks, spec, out_dir, tex=tex, intensity=intensity,
-            progress=progress)
+            zones=zones, progress=progress)
         previews, madeup_renders = _render_previews(model, sel, cloud, made,
                                                     images_dir, out_dir)
         delta_e = _delta_e_report(spec, sel, madeup_renders, images_dir)
@@ -548,6 +778,7 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
     write_ply(made, out_dir / "madeup.ply")
     export_splat(made, out_dir / "madeup.splat")
     export_material(made, out_dir)
+    closeups = _save_zone_closeups(sel, madeup_renders, images_dir, out_dir)
     report = {
         "frames_selected": len(sel.names), "frames_rejected": len(sel.rejected),
         "ref_frame": sel.ref, "train": train_report,
@@ -558,8 +789,13 @@ def run_photoreal(project_dir: str | Path, sfm_dir: str | Path,
         "layers": [l.get("id", l.get("region")) for l in spec.get("layers", [])
                    if l.get("enabled", True)],
         "guidance": bool(guidance), "guidance_auto": guidance_auto,
+        "makeup_zones": (zones.report if zones is not None else {}),
+        "makeup_color_coeffs": color_report,
+        "color_profiles": {r: int(len(p[0])) for r, p in profiles.items()},
+        "color_loop": color_loop,
         "makeup_delta_e": delta_e,
         "fidelity_gate": gate,
+        "closeups": [p.name for p in closeups],
         "seconds": round(time.time() - t0, 1),
     }
     (out_dir / "report.json").write_text(json.dumps(
@@ -575,6 +811,10 @@ def _delta_e_report(spec: dict, sel: FrameSelection,
                     images_dir: Path) -> dict:
     """逐帧妆区 ΔE00（渲染帧 vs spec 目标色）→ 逐区域均值 + 总均值。
 
+    _frame_std = 各帧总均值的标准差（帧间/视角间一致性）：P3 验收里"turntable
+    帧间 ΔE 方差"的离线指标——光照连续性没做好时，同一次妆容在不同视角的
+    还原度会明显离散（壳层 SH 跳变 / 边界接缝在偏角下暴露）。
+
     蒙版由该帧 MediaPipe 观测地标（sel.px）栅格化，与渲染帧同分辨率——
     与烘焙用同一套区域语义，度量的是"交付图里的妆色离 spec 目标多远"。"""
     from .calibrate import (exclude_region_overlap, image_region_masks,
@@ -584,6 +824,7 @@ def _delta_e_report(spec: dict, sel: FrameSelection,
     if not targets or not madeup_renders:
         return {}
     acc: dict[str, list[float]] = {}
+    frame_means: list[float] = []
     for name, img_m in madeup_renders.items():
         px = getattr(sel, "px", {}).get(name)
         if px is None:
@@ -599,13 +840,176 @@ def _delta_e_report(spec: dict, sel: FrameSelection,
         masks = exclude_region_overlap(image_region_masks(
             px_s, size, size, regions=tuple(targets.keys())))
         per = region_delta_e(img_m[..., ::-1], masks, targets)
+        if per:
+            frame_means.append(float(np.mean(list(per.values()))))
         for rgn, v in per.items():
             acc.setdefault(rgn, []).append(v)
     if not acc:
         return {}
     out = {r: round(float(np.mean(v)), 2) for r, v in acc.items()}
     out["_mean"] = round(float(np.mean(list(out.values()))), 2)
+    if len(frame_means) > 1:
+        out["_frame_std"] = round(float(np.std(frame_means)), 2)
     return out
+
+
+def _observe_zones(cloud: dict, model: colmap_io.SparseModel,
+                   sel: FrameSelection, images_dir: Path, spec: dict,
+                   intensity: float, cb: ProgressCB):
+    """P1 语义观测妆区：选帧 → face-parsing → 逐妆区蒙版 → 多视角投票。
+
+    face-parsing 不可用（权重未缓存/无 torch）→ 返回 None，全链路退回几何
+    兜底（landmark_band / uv_template），主链路不阻断。"""
+    from .semantics import build_zones, prepare_views
+    from ...parser import FaceParser
+
+    layers = [l for l in spec.get("layers", []) if l.get("enabled", True)]
+    regions = tuple(dict.fromkeys(l.get("region") for l in layers
+                                  if l.get("region")))
+    if not regions:
+        return None
+    region_scale: dict[str, float] = {}
+    for l in layers:
+        r = l.get("region")
+        if r:
+            region_scale[r] = max(region_scale.get(r, 0.0),
+                                  float(l.get("opacity", 0.7) or 0.7) * intensity)
+    names = [n for n in sel.names if n in model.images]
+    if not names:
+        return None
+    picks = [names[int(i)] for i in np.linspace(0, len(names) - 1,
+                                                min(8, len(names)))]
+    try:
+        feather = {r: float(_load_core().feather_px(r, {}, 1.0))
+                   for r in ("lipstick", "eyebrow")}
+    except Exception:
+        feather = {}
+    cb("semantics", 0.0, "face-parsing 语义分割（妆区观测）…")
+    views = prepare_views(model, picks, images_dir, FaceParser(), regions,
+                          feather_px=feather, progress=cb)
+    if not views:
+        return None
+    normals = None
+    try:                                # 背面剔除：后脑勺 splat 会投进脸部轮廓内
+        from .normals import axis_normals
+        normals = axis_normals(np.asarray(cloud["rot"], np.float64),
+                               np.asarray(cloud["scale"], np.float64))
+    except Exception:
+        pass
+    return build_zones(np.asarray(cloud["xyz"], np.float64), views, regions,
+                       region_scale=region_scale, normals=normals,
+                       progress=cb)
+
+
+def _observe_color_profiles(reference: str | Path, spec: dict,
+                            cb: ProgressCB) -> dict:
+    """参考妆照 → 逐区域 Lab 剖面（P2 "颜色从参考来"的输入端）。
+
+    剖面 = 区域内"边界→核心"向心度上的 Lab 中位序列——唇的内深外浅、眼影
+    层次、腮红落点都在里面，取的全是参考图真实像素。参考图检脸失败/区域
+    像素不足时返回 {}（该区域沿用 spec/手工系数兜底），不阻断主链路。"""
+    from .colorfield import extract_profiles
+
+    regions = tuple(dict.fromkeys(l.get("region") for l in spec.get("layers", [])
+                                  if l.get("enabled", True) and l.get("region")))
+    ref_bgr = cv2.imread(str(reference)) if regions else None
+    if ref_bgr is None:
+        return {}
+    cb("color", 0.0, "参考图 Lab 剖面提取（唇内外渐变/眼影层次/腮红落点）…")
+    try:
+        profiles = extract_profiles(ref_bgr, regions)
+    except Exception as e:                  # 参考图不可用时不阻断主链路
+        cb("color", 1.0, f"参考图剖面提取失败（沿用兜底系数）：{e}")
+        return {}
+    cb("color", 1.0, "参考剖面 " + " ".join(
+        f"{r}×{len(p[0])}档" for r, p in profiles.items()) if profiles
+        else "参考图无可用妆区剖面")
+    return profiles
+
+
+def _spec_from_profiles(spec: dict, profiles: dict, cb: ProgressCB) -> dict:
+    """剖面 → spec 多档色带（`at` = 向心度，与 sample_ramp 语义一致）。"""
+    from .colorfield import spec_from_profiles
+
+    out = spec_from_profiles(spec, profiles)
+    hit = (out.get("calibration") or {}).get("stops") or {}
+    if hit:
+        cb("color", 1.0, "参考色带写入 spec：" + " ".join(
+            f"{r}={n}档" for r, n in hit.items()))
+    return out
+
+
+def _measure_render_lab(sel: FrameSelection,
+                        madeup_renders: dict[str, np.ndarray],
+                        images_dir: Path, regions: tuple[str, ...]) -> dict:
+    """妆后渲染帧的妆区实测 Lab（多帧中位）——闭环"重测"一步的观测端。
+
+    与 _delta_e_report 同一套蒙版语义（该帧观测地标栅格化 + 核心像素中位），
+    因此闭环修正的方向与验收门度量的方向一致。"""
+    from .colorfield import measure_region_lab
+
+    acc: dict[str, list[np.ndarray]] = {}
+    for name, img_m in madeup_renders.items():
+        px = getattr(sel, "px", {}).get(name)
+        ref = cv2.imread(str(images_dir / name))
+        if px is None or ref is None:
+            continue
+        h, w = ref.shape[:2]
+        size = img_m.shape[0]
+        px_s = px.copy()
+        px_s[:, 0] *= size / w
+        px_s[:, 1] *= size / h
+        try:
+            per = measure_region_lab(img_m[..., ::-1], px_s, regions)
+        except Exception:
+            continue
+        for r, lab in per.items():
+            acc.setdefault(r, []).append(np.asarray(lab, np.float64))
+    return {r: np.median(np.stack(v), axis=0) for r, v in acc.items()}
+
+
+def _nudge_profiles(profiles: dict, measured: dict, cb: ProgressCB) -> list[str]:
+    """实测妆区 Lab vs 参考核心 Lab → 剖面整体平移（反向过冲），返回修正区域。"""
+    from .colorfield import loop_delta, reference_core_lab, shift_profile
+
+    moved: list[str] = []
+    for region, prof in profiles.items():
+        m = measured.get(region)
+        if m is None:
+            continue
+        d = loop_delta(m, reference_core_lab(prof))
+        if float(np.abs(d).max()) < 0.5:     # 已在噪声量级，不再推
+            continue
+        profiles[region] = shift_profile(prof, d)
+        moved.append(f"{region}{np.round(d, 1).tolist()}")
+    if moved:
+        cb("export", 0.55, "闭环修正目标色：" + " ".join(moved))
+    return moved
+
+
+def _save_zone_closeups(sel: FrameSelection,
+                        madeup_renders: dict[str, np.ndarray],
+                        images_dir: Path, out_dir: Path) -> list[Path]:
+    """嘴/眼 4× 特写对比（真实帧 | 素颜渲染 | 妆后渲染）——P1 边界验收产物。"""
+    from .semantics import save_zone_closeups
+    for name, img_m in madeup_renders.items():
+        px = getattr(sel, "px", {}).get(name)
+        if px is None:
+            continue
+        ref = cv2.imread(str(images_dir / name))
+        if ref is None:
+            continue
+        h, w = ref.shape[:2]
+        s = img_m.shape[0]
+        px_s = px.copy()
+        px_s[:, 0] *= s / w
+        px_s[:, 1] *= s / h
+        try:
+            return save_zone_closeups(px_s, cv2.resize(ref, (s, s)), None, img_m,
+                                      Path(out_dir))
+        except Exception:
+            return []
+    return []
 
 
 def _save_uv_debug(maps: UvMakeupMaps, path: Path) -> None:

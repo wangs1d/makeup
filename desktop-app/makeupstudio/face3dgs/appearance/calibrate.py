@@ -232,26 +232,44 @@ def extract_makeup_colors(img_bgr: np.ndarray, px: np.ndarray | None = None
 
 
 def calibrate_spec(template: dict, ref_bgr: np.ndarray,
-                   px: np.ndarray | None = None) -> dict:
+                   px: np.ndarray | None = None,
+                   profiles: dict | None = None) -> dict:
     """模板 spec × 参考妆照 → 标定后的 spec（逐区域替换色带与 opacity）。
 
-    形状/finish/层结构沿用模板；只有"颜色与浓度"来自参考图观测。"""
+    形状/finish/层结构沿用模板；只有"颜色与浓度"来自参考图观测。
+    P2：颜色优先走参考图 Lab **剖面**（区域内"边界→核心"多档色带，保留唇的
+    内深外浅/眼影层次/腮红落点），剖面不可用时退回两档均值（extract_makeup_colors
+    的 hex_dark/hex_light）；profiles 可由调用方预先算好复用（避免重复检地标）。"""
     import copy
+
+    if profiles is None:
+        from .colorfield import extract_profiles      # 延迟导入避免循环
+        prof_all = extract_profiles(
+            ref_bgr, [l.get("region") for l in template.get("layers", [])
+                      if l.get("region")], px=px)
+    else:
+        prof_all = profiles
 
     extracted = extract_makeup_colors(ref_bgr, px=px)
     spec = copy.deepcopy(template)
     hit = []
     for layer in spec.get("layers", []):
         region = layer.get("region")
-        if region not in extracted:
+        if region in prof_all:
+            from .colorfield import profile_to_stops
+            layer["color_stops"] = profile_to_stops(prof_all[region])
+        elif region in extracted:
+            e = extracted[region]
+            layer["color_stops"] = [{"at": 0.0, "hex": e["hex_dark"]},
+                                    {"at": 1.0, "hex": e["hex_light"]}]
+        else:
             continue
-        e = extracted[region]
-        layer["color_stops"] = [{"at": 0.0, "hex": e["hex_dark"]},
-                                {"at": 1.0, "hex": e["hex_light"]}]
-        layer["opacity"] = e["opacity"]
+        if region in extracted:
+            layer["opacity"] = extracted[region]["opacity"]
         hit.append(region)
     spec.setdefault("calibration", {})
-    spec["calibration"] = {"regions": hit, "extracted": extracted}
+    spec["calibration"] = {"regions": hit, "extracted": extracted,
+                           "profile_regions": list(prof_all)}
     return spec
 
 

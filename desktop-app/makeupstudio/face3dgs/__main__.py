@@ -6,6 +6,8 @@
     py -m makeupstudio.face3dgs isolate  -p out/face3dgs/proj -o out/face3dgs/face.ply
     py -m makeupstudio.face3dgs fit      -p out/face3dgs/proj --spec makeup-skill/presets/date-rose.json \
                                          -f out/face3dgs/face.ply -o out/face3dgs/fitted
+    py -m makeupstudio.face3dgs single-image -i photo.jpg -p out/lam/me [--spec 妆容.json] \
+                                         → LAM 单图入口（零门槛：一张照片 → 3DGS 资产）
     py -m makeupstudio.face3dgs render   -p out/photoreal/me [--spec 妆容.json] [--ply 已有资产.ply]
                                          → 定妆照 + turntable.mp4 + 素颜对比（后台离线交付，无 Unity）
 """
@@ -37,20 +39,26 @@ def _cmd_capture(args) -> int:
 
 
 def _cmd_status(_args) -> int:
+    """环境自检。首行是**当前解释器**——3DGS 链路要求 gsplat/pycolmap 就装在这个
+    解释器里，跑之前先确认它不是"默认但没装的那一个"。"""
+    import sys
     import torch
+    print(f"python {sys.version.split()[0]}  ({sys.executable})")
     print("torch", torch.__version__, "cuda", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("gpu", torch.cuda.get_device_name(0))
     try:
-        import gsplat  # noqa: F401
-        print("gsplat OK")
+        import gsplat
+        print("gsplat", getattr(gsplat, "__version__", "OK"))
     except Exception as e:
-        print("gsplat 缺失/未编译：", e)
+        print(f"gsplat 缺失/未编译：{e}\n"
+              "  asset/render 依赖它 → 换用已装 gsplat 的解释器（见 docs/photoreal-pipeline.md 四）"
+              "，或 pip install gsplat")
     try:
-        import pycolmap  # noqa: F401
-        print("pycolmap OK")
+        import pycolmap
+        print("pycolmap", getattr(pycolmap, "__version__", "OK"))
     except ImportError:
-        print("pycolmap 缺失：pip install pycolmap")
+        print("pycolmap 缺失：pip install pycolmap（--video 自动链路的 SfM 需要）")
     return 0
 
 
@@ -71,6 +79,37 @@ def _cmd_asset(args) -> int:
         progress=cb)
     print(f"资产完成：{proj / 'asset' / 'base.ply'}")
     print(f"  {report['splats']} splats · PSNR {report['psnr_mean']}dB · {report['seconds']}s")
+    return 0
+
+
+def _cmd_single_image(args) -> int:
+    """单张照片 → LAM canonical 3DGS 资产（可选直接上妆）——零门槛入口（P4）。"""
+    from .appearance import lam_adapter as lam
+    from .appearance.pipeline import build_asset_from_image
+
+    ply = Path(args.ply) if args.ply else None
+    if ply is None and not lam.status().ok:
+        print(f"LAM 环境不完整：{lam.status().missing_hint}\n"
+              "  视频链路不受影响：face3dgs asset -v 视频 -p 工程\n"
+              "  已跑过推理的话用 --ply 指定高斯 ply 直接复跑上妆")
+        return 2
+    spec = json.loads(Path(args.spec).read_text(encoding="utf-8")) if args.spec else None
+
+    def cb(stage, frac, msg):
+        print(f"[{stage:>7}] {frac*100:5.1f}%  {msg}", flush=True)
+
+    out = Path(args.project) / "asset"
+    cloud, _landmarks, report = build_asset_from_image(
+        args.image, out, spec=spec, ply=ply, template=args.template, tex=args.tex,
+        intensity=args.intensity, reference=args.reference, progress=cb)
+    print(f"单图资产完成（base_source={report['base_source']}，"
+          f"{report['splats']} splats）→ {out / 'base.ply'}")
+    if report.get("makeup_zones"):
+        print("  语义妆区（single_seg）：", report["makeup_zones"])
+    if spec:
+        print(f"  妆容渲染 → {out / 'madeup.ply'}")
+    print(f"  后续：face3dgs render -p {args.project}"
+          f"{' --spec ' + args.spec if args.spec else ' --spec 妆容.json'}")
     return 0
 
 
@@ -193,6 +232,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fps", type=float, default=10.0)
     p.add_argument("--no-reuse", action="store_true")
     p.set_defaults(func=_cmd_asset)
+
+    p = sub.add_parser("single-image",
+                       help="单张照片 → LAM canonical 3DGS 资产（可选直接上妆）")
+    p.add_argument("-i", "--image", required=True, help="正面照（jpg/png）")
+    p.add_argument("-p", "--project", required=True, help="工程目录（产物落 <p>/asset/）")
+    p.add_argument("--ply", help="已有的 LAM 高斯 ply（跳过推理，直接配准+上妆）")
+    p.add_argument("--spec", help="妆容 spec json（给定时直接上妆出 madeup.ply）")
+    p.add_argument("--reference", help="妆效参考图（P2 参考驱动颜色标定）")
+    p.add_argument("--template", help="LAM 帧下的 canonical 468 地标模板 .npy（缺省自动）")
+    p.add_argument("--tex", type=int, default=2048, help="UV 图集边长（默认 2048）")
+    p.add_argument("--intensity", type=float, default=0.8)
+    p.set_defaults(func=_cmd_single_image)
 
     p = sub.add_parser("makeup", help="在资产上渲染妆容（秒级换妆）")
     p.add_argument("-p", "--project", required=True)

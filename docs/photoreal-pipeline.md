@@ -206,6 +206,45 @@
 > 34 万 splats 时脸部 ~10 splats/px，亚像素 splat 渲染成点采样花斑/拉丝；
 > 尺度下限 = γ×3近邻均距（γ=0.3 实测去斑保特征，0.5 起糊嘴）。这是对比图里
 > "资产花"的第一根因，比任何光照/材质调整都靠前。
+>
+> **观测驱动升级（2026-09-20，四个阶段）——"涂在哪/什么色"从我的期待换成观测**。
+> 共同根因：妆区位置来自几何模板 + 手工系数、颜色来自手写表，两者都是"期待"
+> 而非观测。四个阶段逐项替换，每阶段独立可验收：
+> ① **妆区定位精度（`appearance/semantics.py`）**：face-parsing（SegFormer-B0，
+>    `makeupstudio/parser.py`）语义分割进链路——视频端多视角语义投票（逐 splat
+>    区域概率，视图数 ≥2 判 `multiview_seg`，单一帧判 `single_seg`），配四级回退
+>    `multiview_seg > single_seg > landmark_band > uv_template`（`build_zones`
+>    的 report 逐区域如实标注 level/views_used/fallback_ratio，不冒充高一级）；
+>    唇/眉沿图像梯度做 edge-snap 修边界。验收 = 逐 splat 妆区 IoU
+>    （`semantics.iou`）+ 嘴/眼特写对比图。
+> ② **颜色忠实（`appearance/colorfield.py` + `calibrate.py`）**：参考图像素直接
+>    决定颜色——向心度场 `inness_field` + `profile_from_mask` 抽出唇内深外浅的
+>    **多档 Lab 剖面**（两档均值会把层次抹平）→ `profile_to_stops` 写进 spec；
+>    迁移系数 (kL, chroma) 由 `solve_region_coeffs` **最小二乘自求解**（手工
+>    PHOTOREAL_LAB 表降级为求解初值），`compare_coeffs` 用 CIEDE2000 对照证明
+>    优于手工表；ΔE00 硬门改为 `loop_delta` 小迭代环（≤2 轮，封顶步长 +
+>    `shift_profile` 保梯度形状）。
+> ③ **自然融合（P3）**：边界羽化场（`feather_px` 逐区域像素级软化）+
+>    按饱和度分区的 SH 策略 + 底模 albedo 高通纹理透出，妆缘不再是一圈硬边。
+> ④ **LAM 单图入口（`appearance/lam_adapter.py`，P4 零门槛）**：一张正面照 →
+>    LAM（aigc3d，SIGGRAPH 2025）回归 canonical 高斯 → 复用整条妆容链路。
+>    关键数据契约：下游一律要求"地标与点云同帧"，故用 canonical 468 模板在
+>    LAM 点云上做**相似配准**（PCA 轴初值 + 鲁棒 ICP）拿到同帧地标落
+>    landmarks.npy，`bind_uv.register` 残差 ≈ 0，管线不为单图入口开分支。
+>    配准的两个坑（实测揪出）：尺度初值用"中位径向距离比"会偏 40%（顶点集与
+>    面片采样的密度分布不同），改**包围盒对角线比**（极值只由曲面决定，无偏；
+>    实测 scale 2.495/真值 2.5）；候选选优必须**按尺度归一化**，否则"整体缩小"
+>    的错误局部极小因残差绝对值小而胜出。照片→高斯的语义提升走
+>    `weak_perspective_fit`（模板→照片 2D 弱透视）∘ 模板帧→点云帧，等价成
+>    点云帧下与照片同视角的针孔相机，`photo_zones` 单视角自然落 `single_seg`。
+>    门控同 flame_avatar/guidance：环境缺失给可执行提示、返回码 2，视频主链路
+>    不阻断。诚实边界写进 report：LAM 底模是单图回归的先验人脸，细节低于视频
+>    链路的光度重建，交付级仍走视频链路。
+>    入口：`face3dgs single-image -i 照片 -p 工程 [--ply 已有高斯] [--spec 妆容]`
+>    或 `preview/run_photoreal.py --image 照片 --spec 妆容 --out 出目录`。
+> 测试：`tests/test_color_field.py`（P2）、`tests/test_semantics_zones.py`（P1）、
+> `tests/test_lam_adapter.py`（P4，18 项，含配准/照片视角/语义提升/单图全链路，
+> 全 CPU 不依赖 LAM 权重与 mediapipe）；`pytest tests -q` 252 passed / 2 skipped。
 
 ## 一、旧链路为什么不可能逼真（根因，不是参数问题）
 
@@ -257,6 +296,10 @@ python preview/run_photoreal.py --project out/real --sfm out/real/sfm/sparse/3 \
 
 # 只改妆容重跑（--reuse-base 默认开启，底模秒级复用）
 python preview/run_photoreal.py ... --iters 0 --skip-train
+
+# 单张正面照（LAM 单图入口，零门槛；环境缺失给提示不阻断视频链路）
+python preview/run_photoreal.py --image 我的照片.jpg \
+    --spec makeup-skill/presets/date-rose.json --out out/lam/me
 ```
 
 产物（out/photoreal/<name>/）：`base.ply/.splat`（素颜底模）、`madeup.ply/.splat`
@@ -264,17 +307,32 @@ python preview/run_photoreal.py ... --iters 0 --skip-train
 `GaussianAvatarParser.LoadMaterial` 消费）、`makeup_uv_debug.png`（UV 妆容图）、
 `compare_*.png`（真实帧|素颜|妆后）、`train_report.json`/`report.json`。
 
-## 四、环境依赖（本机已就绪）
+## 四、环境依赖（**解释器选错是第一坑**）
 
-- CUDA torch 2.9.1+cu130 + **gsplat 1.5.3**（源码编译，见下）+ torchvision/lpips 可选
-- gsplat Windows 编译三件套：VS Build Tools (C++ 工作负载) + CUDA Toolkit 13.4 + 
-  `NVCC_FLAGS="-Xcompiler /Zc:preprocessor"`（CUDA 13 CCCL 强制要求标准预处理器）
+- **3DGS 链路（`asset` / `makeup` / `render`，以及 `run_photoreal.py`）必须跑在装了
+  gsplat + pycolmap 的那个解释器上**。本机（RTX 4060 Laptop）：
+  `py -3.10` → torch 2.4.1+cu124 / **gsplat 1.5.3+pt24cu124** / pycolmap 4.2.0 /
+  opencv 5.0.0 / mediapipe 1.0.1（`gsplat` 是预编译 wheel，**不需要自己编译**）；
+  而默认的 `python`（`py -3.12`）只有 torch 2.6.0+cu124，**没装 gsplat/pycolmap**，
+  直接跑 render 就是 `ModuleNotFoundError: No module named 'gsplat'`。
+- 自检：`py -3.10 -m makeupstudio.face3dgs status`——首行打印**当前解释器全路径**，
+  一眼看出是不是选错了环境；gsplat 缺失时给出的提示也指向"换解释器/先装"。
+- 本机两个解释器**分工**（别混）：
+  | 用途 | 解释器 | 关键依赖 |
+  |---|---|---|
+  | 3DGS 链路 `asset`/`render`、`run_photoreal.py` | `py -3.10` | gsplat 1.5.3 / pycolmap 4.2.0 |
+  | 单测 `pytest tests`、纯 numpy 工具 | `py -3.12`（默认 `python`） | pytest / scipy |
+  `makeup` 子命令只做 UV 合成与导出，不碰 gsplat，两个解释器都能跑。
+- 另一台验收机（RTX 5060 Ti）走的是**源码编译**路线：CUDA torch 2.9.1+cu130 +
+  gsplat 1.5.3（VS Build Tools C++ 工作负载 + CUDA Toolkit 13.4 +
+  `NVCC_FLAGS="-Xcompiler /Zc:preprocessor"`，CUDA 13 CCCL 强制要求标准预处理器）。
+  本机已有匹配 torch 2.4.1 的预编译 wheel，无需重复这条路。
 - **上游 v1.5.3 的已知缺陷（本仓库已打桩绕过，标准 rasterization() 路径不受影响）**：
   `Rasterization.cpp` 调用的 `launch_rasterize_to_pixels_2dgs_bwd_kernel` 与
   `launch_rasterize_to_pixels_from_world_3dgs_{fwd,bwd}_kernel` 三族符号，
   其 .cu 定义与头文件声明签名不一致（前者 .cu 多一个 uint32_t 参数），
   Windows 链接失败；这三个内核不在 `rasterization()` 主路径上。
-  安装脚本：`out/probe/install_gsplat.bat`（glm 子模块需手动放入 third_party）。
+  源码编译时的安装脚本：`out/probe/install_gsplat.bat`（glm 子模块需手动放入 third_party）。
 
 ## 五、验收数据（out/real/d6，RTX 5060 Ti）
 
@@ -305,7 +363,8 @@ python preview/run_photoreal.py ... --iters 0 --skip-train
    已先行消费同一套语义，见 F 升级 ①）
 2. ~~Stable-Makeup guidance 接入 `optimize.py`~~（F 升级 ③ 已接通；剩余是把
    Stable-Makeup 换成更强/multi-shot 的迁移模型时只需替换 `guidance.generate`）
-3. LAM 单图入口（`face3dgs/lam_adapter.py`，门控）：无视频用户秒级底模
+3. ~~LAM 单图入口（`face3dgs/lam_adapter.py`，门控）：无视频用户秒级底模~~（已落地，
+   见上文"观测驱动升级 ④"；剩余是把 canonical 模板换成 LAM 仓库自带的 468 地标导出）
 4. FLAME 表情驱动（P6）：canonical 头像 + LBS，妆随表情走
 5. ~~还原度进产品验收门~~（F++ ② 已落地：逐区域 ΔE00 预算 + 无参考自动重标定）
 6. 云端批渲染服务化（任务队列/多资产并行——AOV 光栅化合并 pass 可再提速）；

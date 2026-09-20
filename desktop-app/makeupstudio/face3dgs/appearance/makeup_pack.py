@@ -143,8 +143,12 @@ def _build_slots(maps, ordered_layers: list[dict], t: int) -> tuple[list, list, 
             _ensure(k)
             slot_w[k][take] = layer["w"][take]
             slot_albedo[k][take] = layer["tgt"][take]
-            slot_kL[k][take] = float(layer["kL"])
-            slot_chroma[k][take] = float(layer["chroma"])
+            kLv = layer["kL"]                    # 标量或 (t,t) 羽化场（P3）
+            slot_kL[k][take] = (np.asarray(kLv, np.float32)[take]
+                                if np.ndim(kLv) else float(kLv))
+            chv = layer["chroma"]
+            slot_chroma[k][take] = (np.asarray(chv, np.float32)[take]
+                                    if np.ndim(chv) else float(chv))
             occupied[k] |= take
             remaining = remaining & ~take
         # 超出 MAX_SLOTS 的深层丢弃（当前 spec 结构下实测 ≤3，防御性截断）
@@ -153,7 +157,7 @@ def _build_slots(maps, ordered_layers: list[dict], t: int) -> tuple[list, list, 
 
 def compose_pack(baker, cloud: dict[str, np.ndarray], maps, uv: np.ndarray,
                  valid: np.ndarray, lip3d=None, near=None, bands3d=None,
-                 sigma: float = DEFAULT_SIGMA) -> "MakeupPack":
+                 zones=None, sigma: float = DEFAULT_SIGMA) -> "MakeupPack":
     """bake 目标场 + per-splat 指派 → 融合 pack。
 
     baker: UvMakeupBaker（复用其 _assignment——唇/眼线 3D 锚定、near 软门控、
@@ -174,7 +178,8 @@ def compose_pack(baker, cloud: dict[str, np.ndarray], maps, uv: np.ndarray,
     core.set_texture_size(tex)
     try:
         a = baker._assignment(cloud, maps, np.asarray(uv, np.float64),
-                              np.asarray(valid, bool), core, lip3d, near, bands3d)
+                              np.asarray(valid, bool), core, lip3d, near, bands3d,
+                              zones)
     finally:
         core.set_texture_size(prev_tex)
 

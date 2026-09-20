@@ -6,6 +6,11 @@
 方式二（已有 SfM 工程，分步复用）：
     python preview/run_photoreal.py --project out/real --sfm out/real/sfm/sparse/3         --init out/real/project/face_dense.ply --spec makeup-skill/presets/date-rose.json         --out out/photoreal/d6
 
+方式三（单张正面照，零门槛）：
+    python preview/run_photoreal.py --image 我的照片.jpg         --spec makeup-skill/presets/date-rose.json --out out/lam/me
+    → LAM（aigc3d，SIGGRAPH 2025）单图回归 canonical 高斯；底模逼真度低于视频链路
+      （report["honesty"] 如实标注），语义妆区只有一帧观测（single_seg 级）。
+
 换妆只重跑妆容段（资产已存在时自动复用底模，秒级）。
 """
 from __future__ import annotations
@@ -45,9 +50,50 @@ def _make_init_cloud(sfm_dir: str, out_ply: str, project: Path) -> None:
     print(f"[entry] 初始点云 {len(pts)} 点 → {out_ply}")
 
 
+def _run_single_image(args) -> int:
+    """方式三：单张正面照 → LAM canonical 3DGS 资产 → 妆容（P4 零门槛入口）。
+
+    与视频链路的差别只在底模来源；UV 绑定/目标场/壳层/材质/离线渲染完全复用。
+    环境缺失时给可执行提示并返回 2，视频主链路不受影响。"""
+    from makeupstudio.face3dgs.appearance import lam_adapter as lam
+    from makeupstudio.face3dgs.appearance.pipeline import build_asset_from_image
+
+    st = lam.status()
+    if not st.ok:
+        print(f"LAM 环境不完整：{st.missing_hint}\n"
+              "  视频链路不受影响：python preview/run_photoreal.py "
+              "--video 视频.mp4 --spec 妆容.json --out out/photoreal/me", file=sys.stderr)
+        return 2
+    spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    out = Path(args.out)
+    asset = out / "asset"
+
+    def cb(stage: str, frac: float, msg: str) -> None:
+        print(f"[{stage:>7}] {frac * 100:5.1f}%  {msg}", flush=True)
+
+    print(f"[entry] image={args.image} out={out}", flush=True)
+    _cloud, _lm, report = build_asset_from_image(
+        args.image, asset, spec=spec, tex=args.tex, intensity=args.intensity,
+        reference=args.reference, progress=cb)
+    # 落一份 report.json 到 --out，与视频链路同位置（下游工具按 --out/report.json 找）
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"[quality] base_source={report['base_source']} / "
+          f"{report['splats']} splats / 地标配准 rmse="
+          f"{report['lam']['landmarks_rmse']:.4f}")
+    if report.get("makeup_zones"):
+        print(f"[zones] {report['makeup_zones']}")
+    print(f"[honesty] {report['honesty']}")
+    print(f"完成 → {asset / 'madeup.ply'}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--video", default=None, help="上传视频路径（全自动：抽帧+SfM+训练+妆容）")
+    ap.add_argument("--image", default=None,
+                    help="单张正面照（LAM 单图入口 → canonical 3DGS 资产 → 妆容）")
     ap.add_argument("--project", default=None, help="采集工程目录（含 capture/frames 或 images）")
     ap.add_argument("--sfm", default=None, help="COLMAP sparse 目录（--video 模式自动生成）")
     ap.add_argument("--init", default=None, help="初始化点云 ply（缺省用 COLMAP 点稠密化）")
@@ -64,8 +110,11 @@ def main() -> int:
     ap.add_argument("--skip-train", action="store_true")
     args = ap.parse_args()
 
+    if args.image:                      # 方式三：单图入口（不预标定 spec，交给管线做）
+        return _run_single_image(args)
     if not args.video and not (args.project and args.sfm):
-        print("需要 --video（全自动）或 --project+--sfm（已有工程）", file=sys.stderr)
+        print("需要 --video（全自动）或 --project+--sfm（已有工程）或 --image（单图）",
+              file=sys.stderr)
         return 2
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
     if args.reference:

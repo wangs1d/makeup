@@ -20,22 +20,24 @@
 ## 快速开始（产品主链路）
 
 ```bash
-# 0) 环境：CUDA GPU + pip install torch gsplat pycolmap（详见 docs/photoreal-pipeline.md）
-cd desktop-app && python -m makeupstudio.face3dgs status   # 环境自检
+# 0) 环境：CUDA GPU + gsplat + pycolmap，装在同一个解释器里（详见 docs/photoreal-pipeline.md 四）
+#    ⚠ 解释器选错是最常见的坑：下面几条命令里的 python 必须换成本机装了 gsplat 的那个。
+#    本机（RTX 4060 Laptop）：gsplat 1.5.3+pt24cu124 在 py -3.10；默认的 py -3.12 没有。
+py -3.10 -m makeupstudio.face3dgs status   # 环境自检（首行打印当前解释器全路径）
 
 # 1) 资产化（二选一）
 #    a. 摄像头环绕扫描（桌面 App 内点击，或 CLI 引导式采集）
-cd desktop-app && python -m makeupstudio.face3dgs capture -o ../out/face3dgs/me.mp4
+cd desktop-app && py -3.10 -m makeupstudio.face3dgs capture -o ../out/face3dgs/me.mp4
 #    b. 上传视频全自动：抽帧 → SfM → gsplat 训练 → base.ply
-python preview/run_photoreal.py --video 我的视频.mp4 \
+py -3.10 preview/run_photoreal.py --video 我的视频.mp4 \
     --project out/scan --spec makeup-skill/presets/date-rose.json --out out/photoreal/me
 
-# 2) 换妆（秒级，复用资产）
+# 2) 换妆（秒级，复用资产；纯 numpy，任一解释器均可）
 cd desktop-app && python -m makeupstudio.face3dgs makeup -p ../out/scan \
     --spec ../makeup-skill/presets/date-rose.json
 
-# 3) 离线高保真交付（定妆照 + RGBA 抠图层 + turntable.mp4 + 素颜对比）
-python -m makeupstudio.face3dgs render -p ../out/scan --sfm ../out/scan/sfm/sparse/1 \
+# 3) 离线高保真交付（定妆照 + RGBA 抠图层 + turntable.mp4 + 素颜对比；需要 gsplat）
+py -3.10 -m makeupstudio.face3dgs render -p ../out/scan --sfm ../out/scan/sfm/sparse/1 \
     --background studio --light warm --size 1080 --ssaa 2
 #    质量门禁：C 级资产（低清源）默认拒绝出图（--force 仅诊断）；denoise 按分级自动
 ```
