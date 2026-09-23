@@ -32,18 +32,50 @@ SH_C0 = 0.28209479112561376
 @dataclass
 class TrainConfig:
     iters: int = 20000
-    max_gs: int = 400_000
+    max_gs: int = 900_000          # 高斯数上限。400k 时代 30k iter 在 15k 就触顶，
+                                   # densify 后半程被饿死——唇纹/眼睑的高频细节
+                                   # 靠密度换。8GB 显存 @480² 实测 900k 可容
     refine_stop_frac: float = 0.75
     reset_every: int = 3000
     refine_every: int = 100
+    grow_grad2d: float = 0.00013   # 稠密化梯度阈（gsplat 默认 2e-4）：调低让
+                                   # 唇线/眼睑等高频区更早分裂出新高斯
     ssim_weight: float = 0.2
-    sh_degree: int = 2               # SH 高阶：视角相关外观（油光/高光），0=仅 DC
+    sh_degree: int = 1               # SH 阶数：≤15 视角的采集默认 1。A/B 实测
+                                     # （2026-09-22，同数据 30k iters）：deg2 的
+                                     # 21 个高阶通道过拟合视角噪声——残差渲染成
+                                     # 彩斑，稍偏训练视线即灾难（deliver 实测）；
+                                     # deg1 留出 PSNR 更高（23.96 vs 23.69）、
+                                     # orbit 渲染质量分最优、SH 可安全参与渲染。
+                                     # ≥1080p 多视角重录后可回 2（视角相关油光）
+    sh_weight: float = 2e-4          # SH 高阶 L2 正则：≤15 个训练视角时 21 个高阶
+                                     # 通道必然过拟合 → 合成视角外推成彩色碎斑；
+                                     # 眉眼碎斑主要是 SH 残差，密度上来后逐 splat
+                                     # 约束变弱，2e-4 再压一档（0=旧行为）
     antialiased: bool = True         # Mip-Splatting 式 2D 滤波：拉近拉远不呼吸
-    mip3d_gamma: float = 0.3         # 3D 平滑滤波 γ：尺度下限=γ×近邻距（0=关）；
-                                     # 训练分辨率下亚像素 splat 的点采样花斑主修复
+    mip3d_gamma: float = 0.25        # 3D 平滑滤波 γ：尺度下限=γ×近邻距（0=关）。
+                                     # 0.3 压花斑但明显糊唇；曝光补偿 + 密度上来
+                                     # 之后花斑的根因减弱，降到 0.25 换回锐度
     hull_margin: float = 1.12        # 地标凸包外扩（含发际边缘，不含背景墙）
     feather_px: int = 13             # 蒙版羽化（软权重）
-    eval_holdout: int = 6            # 留出验证帧数
+    eval_holdout: int = 4            # 留出验证帧数（6→4：7 个训练视角养不活
+                                     #  densify，验证密度让位于视图数）
+    exposure_comp: bool = True       # 逐视图 log-gain 曝光补偿：自拍视频的自动
+                                     # 曝光漂移让同一表面点在帧间亮度不一致 →
+                                     # 3DGS 折中成"降饱和+漂浮物"。联合优化
+                                     # 每视图 3 维 log-gain，颜色一致性问题
+                                     # 从几何层挪到光照层
+    # ---- 器官一致性屏蔽（跨帧外观漂移的器官从全权重损失里降权）----
+    # 嘴内（牙齿/口腔）：闭嘴 canonical（frames.closed_lips）下内唇环退化，
+    # 本屏蔽自动失效（闭嘴时根本没有牙齿问题）；它只作为张嘴兜底带的安全冗余。
+    # 眼球：**不再挖洞**——上一版 0.35 降权把眼睛的细节也一起饿死了（用户
+    # 可见回退）。视线一致性交给 gaze 特征聚类（gaze_weight=2），眼球保持
+    # 全监督；1.0 = 无屏蔽。
+    mouth_weight: float = 0.12
+    eye_weight: float = 1.0
+    mouth_shrink: float = 0.85       # 内唇环多边形向质心收缩（保护唇线像素）
+    eye_shrink: float = 0.55         # 眼开多边形收缩（仅 eye_weight<1 时有意义）
+    lpips_eval: bool = True          # 留出帧 LPIPS（感知指标；缺包自动跳过）
     seed: int = 0
 
 
@@ -53,25 +85,58 @@ class View:
     w2c: np.ndarray                  # (4,4) world-to-cam（COLMAP R,t 直接构成）
     K: np.ndarray                    # (3,3)
     img: np.ndarray                  # (H,W,3) float32 0..1 RGB
-    mask: np.ndarray                 # (H,W) float32 0..1 脸区软权重
+    mask: np.ndarray                 # (H,W) float32 0..1 脸区软权重（含器官孔）
 
 
-def quat_to_rotmat(q: np.ndarray) -> np.ndarray:
-    w, x, y, z = q
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-    ], np.float64)
+# 眼开多边形（FaceMesh 468 拓扑，顺/逆时针均可——fillPoly 不要求有序方向）。
+# 收缩后只盖眼球（虹膜/巩膜），眼睑缘保持全监督（眼线/睫毛区域的真相来源）。
+EYEBALL_RING = {
+    "left": (33, 246, 161, 160, 159, 158, 157, 173, 133,
+             155, 154, 153, 145, 144, 163, 7),
+    "right": (263, 466, 388, 387, 386, 385, 384, 398, 362,
+              382, 381, 380, 374, 373, 390, 249),
+}
+
+
+def _suppression_mask(h: int, w: int, poly_px: np.ndarray, shrink: float,
+                      weight: float, feather_px: float) -> np.ndarray:
+    """器官屏蔽图 (H,W)：多边形内向 weight 软衰减，边缘 feather_px 羽化。
+
+    返回乘性权重（1=不衰减）；多边形无效（地标缺失/退化）返回全 1。"""
+    import cv2
+    poly = np.asarray(poly_px, np.float64)
+    if len(poly) < 3 or not np.isfinite(poly).all():
+        return np.ones((h, w), np.float32)
+    if (np.linalg.norm(poly, axis=1) <= 0).any():
+        return np.ones((h, w), np.float32)
+    if shrink != 1.0:
+        cen = poly.mean(0)
+        poly = (poly - cen) * float(shrink) + cen
+    m = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(m, [np.round(poly).astype(np.int32)], 255)
+    if float(m.sum()) / 255.0 < 4.0:            # 闭嘴等退化：孔不存在
+        return np.ones((h, w), np.float32)
+    soft = cv2.GaussianBlur(m.astype(np.float32) / 255.0,
+                            (0, 0), max(feather_px, 1.0) / 2.5)
+    return (1.0 - (1.0 - float(weight)) * np.clip(soft, 0, 1)).astype(np.float32)
+
+
+def _mouth_interior_ring() -> np.ndarray:
+    """内唇环地标索引（landmark-regions.json 的 lips_inner，与唇拓扑同源）。"""
+    import json
+    from ..fit_makeup import _REFS
+    data = json.loads((_REFS / "landmark-regions.json").read_text(encoding="utf-8"))
+    return np.asarray(data["regions"]["lips_inner"]["indices"], np.int64)
 
 
 def build_views(model: colmap_io.SparseModel, sel: FrameSelection,
                 images_dir: Path, cfg: TrainConfig) -> list[View]:
-    """COLMAP 位姿 + 表情簇帧 → 训练视图（含脸区软蒙版）。"""
+    """COLMAP 位姿 + 表情簇帧 → 训练视图（脸区软蒙版 + 嘴内/眼球屏蔽孔）。"""
     cam = model.camera
     K = np.array([[cam.params[0], 0, cam.params[1]],
                   [0, cam.params[0], cam.params[2]],
                   [0, 0, 1]], np.float64)
+    mouth_ring = _mouth_interior_ring()
     views: list[View] = []
     for name in sel.names:
         img = cv2.imread(str(images_dir / name))
@@ -89,17 +154,34 @@ def build_views(model: colmap_io.SparseModel, sel: FrameSelection,
         w2c[:3, :3] = R
         w2c[:3, 3] = t
         # 脸区软蒙版：468 地标凸包外扩 + 羽化
-        pts = sel.px[name][:468].astype(np.int32)
+        px = sel.px[name]
+        pts = px[:468].astype(np.int32)
         hull = cv2.convexHull(pts.reshape(-1, 1, 2))
         cen = pts.mean(0)
         hull_out = ((hull[:, 0, :] - cen) * cfg.hull_margin + cen).astype(np.int32)
         m = np.zeros((h, w), np.uint8)
         cv2.fillConvexPoly(m, hull_out, 255)
-        m = cv2.GaussianBlur(m, (0, 0), cfg.feather_px / 2.5)
+        m = cv2.GaussianBlur(m, (0, 0), cfg.feather_px / 2.5).astype(np.float32) / 255.0
+        # 器官屏蔽：跨帧外观漂移的器官降权（牙齿/口腔、虹膜/巩膜）。
+        # 地标不足 478 时眼球环仍可用（<468 的观测帧已在选帧阶段剔除）
+        if len(px) >= 468:
+            m = m * _suppression_mask(h, w, px[mouth_ring], cfg.mouth_shrink,
+                                      cfg.mouth_weight, cfg.feather_px)
+            for side in ("left", "right"):
+                m = m * _suppression_mask(h, w, px[list(EYEBALL_RING[side])],
+                                          cfg.eye_shrink, cfg.eye_weight,
+                                          cfg.feather_px)
         views.append(View(name=name, w2c=w2c, K=Kf,
                           img=cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0,
-                          mask=m.astype(np.float32) / 255.0))
+                          mask=m.astype(np.float32)))
     return views
+def quat_to_rotmat(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ], np.float64)
 
 
 def _init_params(init_cloud: dict[str, np.ndarray], sh_degree: int = 0):
@@ -162,14 +244,25 @@ def train_base(views: list[View], init_ply: str | Path,
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
 
-    hold_idx = set(np.linspace(0, len(views) - 1, cfg.eval_holdout).astype(int))
+    # 留出帧数自适应：视图池小时验证最多吃 20%（14 帧 → 留 2 验 12）
+    hold_n = int(min(cfg.eval_holdout, max(1, len(views) // 5)))
+    hold_idx = set(np.linspace(0, len(views) - 1, hold_n).astype(int))
     train = [v for i, v in enumerate(views) if i not in hold_idx]
-    eval_ = [v for i, v in enumerate(views) if i in hold_idx]
+    eval_, eval_orig = [], []
+    for i, v in enumerate(views):
+        if i in hold_idx:
+            eval_.append(v)
+            eval_orig.append(i)
+    train_orig = [i for i in range(len(views)) if i not in hold_idx]
 
     params = _init_params(read_ply(init_ply), sh_degree=cfg.sh_degree)
     params = {k: torch.nn.Parameter(v) for k, v in params.items()}
     extent = float(torch.linalg.vector_norm(
         params["means"].detach() - params["means"].detach().mean(0), dim=1).mean())
+    # 逐视图曝光补偿：log-gain (V,3)，初始 0（=增益 1）。渲染后乘增益再对 GT。
+    # 自拍视频自动曝光/白平衡漂移是颜色不一致的主要来源——不补偿时 3DGS 把
+    # 帧间亮度差折中成降饱和 + 漂浮物。
+    gains = torch.nn.Parameter(torch.zeros(len(train), 3, device="cuda"))
     optimizers = {
         "means": torch.optim.Adam([{"params": [params["means"]], "lr": 1.6e-4 * extent}]),
         "quats": torch.optim.Adam([{"params": [params["quats"]], "lr": 1e-3}]),
@@ -177,12 +270,18 @@ def train_base(views: list[View], init_ply: str | Path,
         "opacities": torch.optim.Adam([{"params": [params["opacities"]], "lr": 5e-2}]),
         "colors": torch.optim.Adam([{"params": [params["colors"]], "lr": 2.5e-3}]),
     }
+    if cfg.exposure_comp:
+        optimizers["gains"] = torch.optim.Adam([{"params": [gains], "lr": 5e-3}])
+    # gains 是纯外观校正参数，不属于 splat 几何/外观参数组——gsplat 的
+    # strategy 只认 (means/quats/scales/opacities/colors)，多余的键会断言
+    splat_optimizers = {k: v for k, v in optimizers.items() if k != "gains"}
     strategy = DefaultStrategy(
         verbose=False, absgrad=True,
+        grow_grad2d=cfg.grow_grad2d,
         refine_start_iter=500, refine_stop_iter=int(cfg.iters * cfg.refine_stop_frac),
         reset_every=cfg.reset_every, refine_every=cfg.refine_every,
         pause_refine_after_reset=256)
-    strategy.check_sanity(params, optimizers)
+    strategy.check_sanity(params, splat_optimizers)
     state = strategy.initialize_state(scene_scale=extent * 1.1)
 
     imgs = torch.stack([torch.tensor(v.img, device="cuda") for v in train])
@@ -204,12 +303,19 @@ def train_base(views: list[View], init_ply: str | Path,
         info["means2d"].retain_grad()
         gt = imgs[ci].permute(2, 0, 1)
         mw = masks[ci][None]
-        loss = ((renders[0].permute(2, 0, 1) - gt).abs().mean(0) * mw).sum() / mw.sum()
-        loss = loss + cfg.ssim_weight * (1 - _ssim(renders[0].permute(2, 0, 1) * mw, gt * mw))
-        strategy.step_pre_backward(params, optimizers, state, step, info)
+        pred = renders[0].permute(2, 0, 1)
+        if cfg.exposure_comp:
+            pred = pred * torch.exp(gains[ci])[:, None, None]
+        loss = ((pred - gt).abs().mean(0) * mw).sum() / mw.sum()
+        loss = loss + cfg.ssim_weight * (1 - _ssim(pred * mw, gt * mw))
+        if cfg.sh_weight > 0 and params["colors"].shape[1] > 1:
+            # SH 高阶 L2：训练视角少时高阶系数在无监督视线方向自由生长，
+            # 合成视角一外推就碎成彩色斑；L2 把残差压向 DC 主色
+            loss = loss + cfg.sh_weight * (params["colors"][:, 1:, :] ** 2).mean()
+        strategy.step_pre_backward(params, splat_optimizers, state, step, info)
         loss.backward()
         if params["means"].shape[0] < cfg.max_gs:      # 高斯数上限（1.5.3 无内建 cap）
-            strategy.step_post_backward(params, optimizers, state, step, info,
+            strategy.step_post_backward(params, splat_optimizers, state, step, info,
                                         packed=False)
         for opt in optimizers.values():
             opt.step()
@@ -219,10 +325,20 @@ def train_base(views: list[View], init_ply: str | Path,
             cb(step / cfg.iters, f"iter {step}/{cfg.iters}  loss={float(loss):.4f}  splats={n_gs}")
     train_s = time.time() - t0
 
-    # ---- 留出帧 PSNR ----
+    # ---- 留出帧 PSNR（+ 可选 LPIPS：感知质量，蒙版 bbox 裁剪去背景差异）----
+    lpips_fn = None
+    if cfg.lpips_eval:
+        try:
+            import lpips as _lpips
+            lpips_fn = _lpips.LPIPS(net="vgg").to("cuda")
+            for p in lpips_fn.parameters():
+                p.requires_grad = False
+        except Exception:
+            lpips_fn = None
+
     with torch.no_grad():
-        psnrs = []
-        for v in eval_:
+        psnrs, lpips_vals = [], []
+        for e_i, v in enumerate(eval_):
             r, _a, _i = rasterization(
                 params["means"], params["quats"] / params["quats"].norm(dim=1, keepdim=True),
                 torch.exp(params["scales"]), torch.sigmoid(params["opacities"][..., 0]),
@@ -233,10 +349,22 @@ def train_base(views: list[View], init_ply: str | Path,
                 sh_degree=cfg.sh_degree,
                 rasterize_mode="antialiased" if cfg.antialiased else "classic",
                 packed=False, backgrounds=torch.zeros(1, 3, device="cuda"))
+            if cfg.exposure_comp:
+                # 留出视图没有自己的增益：借用时间最近的训练视图的
+                # （视频帧序相邻 → 曝光状态最接近）
+                j = int(np.argmin(np.abs(np.asarray(train_orig) - eval_orig[e_i])))
+                r = r * torch.exp(gains[j])[None, None, None, :]
             mw = torch.tensor(v.mask, device="cuda")
             gt = torch.tensor(v.img, device="cuda")
             mse = ((r[0] - gt) ** 2).mean(2)[mw > 0.5].mean()
             psnrs.append(float(-10 * torch.log10(mse)))
+            if lpips_fn is not None:
+                ys, xs = torch.nonzero(mw > 0.5, as_tuple=True)
+                y0, y1 = int(ys.min()), int(ys.max()) + 1
+                x0, x1 = int(xs.min()), int(xs.max()) + 1
+                crop_r = r[0, y0:y1, x0:x1].permute(2, 0, 1)[None]
+                crop_g = gt[y0:y1, x0:x1].permute(2, 0, 1)[None]
+                lpips_vals.append(float(lpips_fn(2 * crop_r - 1, 2 * crop_g - 1)))
 
     means = params["means"].detach().cpu().numpy()
     quats = params["quats"].detach().cpu().numpy()
@@ -293,12 +421,22 @@ def train_base(views: list[View], init_ply: str | Path,
     report = {"iters": cfg.iters, "splats": int(len(cloud["xyz"])),
               "train_views": len(train), "eval_views": len(eval_),
               "sh_degree": cfg.sh_degree, "antialiased": cfg.antialiased,
-              "mip3d_gamma": cfg.mip3d_gamma,
+              "sh_weight": cfg.sh_weight, "mip3d_gamma": cfg.mip3d_gamma,
+              "grow_grad2d": cfg.grow_grad2d,
+              "max_gs": cfg.max_gs,
+              "exposure_comp": cfg.exposure_comp,
+              "gain_abs_max_db": (round(float(gains.detach().abs().max()) * 8.686, 2)
+                                  if cfg.exposure_comp else None),
+              "mouth_weight": cfg.mouth_weight, "eye_weight": cfg.eye_weight,
               "light_dir_world": [round(float(x), 4) for x in light_dir],
               "light_strength": round(float(light_strength), 4),
               "light_tint": [round(float(x), 4) for x in light_tint],
               "psnr_masked": [round(p, 2) for p in psnrs],
               "psnr_mean": round(float(np.mean(psnrs)), 2),
+              "lpips_masked": ([round(v, 4) for v in lpips_vals]
+                               if lpips_vals else None),
+              "lpips_mean": (round(float(np.mean(lpips_vals)), 4)
+                             if lpips_vals else None),
               "seconds": round(train_s, 1), "extent": round(extent, 4)}
     (out_dir / "train_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

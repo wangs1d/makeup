@@ -57,11 +57,18 @@ def main() -> int:
                          "并在 report 输出逐区域 ΔE00 还原度）")
     ap.add_argument("--out", required=True, help="输出目录")
     ap.add_argument("--iters", type=int, default=20000)
-    ap.add_argument("--max-gs", type=int, default=400_000)
+    ap.add_argument("--max-gs", type=int, default=900_000)
     ap.add_argument("--tex", type=int, default=2048)
     ap.add_argument("--intensity", type=float, default=0.8)
     ap.add_argument("--no-reuse-base", action="store_true")
     ap.add_argument("--skip-train", action="store_true")
+    ap.add_argument("--no-auto-cal", action="store_true",
+                    help="关闭 ΔE 超阈值的自动重标定闭环（默认开）")
+    ap.add_argument("--look2d", default=None,
+                    help="2D 人台渲染图路径：同一 spec 的 2D 预览逐区域 ΔE00 "
+                         "进 report（2D/3D 一致性交叉检查）")
+    ap.add_argument("--preview-2d", action="store_true",
+                    help="EleGANt 就绪时产出参考帧的 2D 迁移预览 preview_2d.png")
     args = ap.parse_args()
 
     if not args.video and not (args.project and args.sfm):
@@ -98,7 +105,10 @@ def main() -> int:
 
     run_photoreal(args.project, args.sfm, args.init, spec, args.out,
                   train_cfg=cfg, tex=args.tex, intensity=args.intensity,
-                  reuse_base=not args.no_reuse_base, progress=cb)
+                  reuse_base=not args.no_reuse_base,
+                  auto_calibrate=not args.no_auto_cal,
+                  preview_2d=args.preview_2d,
+                  look2d=args.look2d, progress=cb)
     return 0
 
 

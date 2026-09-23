@@ -116,8 +116,9 @@ python makeup-skill/scripts/render_look.py --spec makeup-skill/presets/date-rose
 ## 测试
 
 ```bash
-python -m pytest tests/ -q     # 84 项：画像管线（PLY/语义/编译器/光栅）/追踪协议/蒙版规则/渲染/
-                               # bridge 路由/资产侧车/教练状态机/C#·shader 静态检查
+python -m pytest tests/ -q     # 182 项：画像管线（PLY/语义/编译器/光栅）/追踪协议/蒙版规则/渲染/
+                               # bridge 路由/资产侧车/教练状态机/还原度升级（pigment-safe ΔE00/
+                               # 壳层/powder 压油光/形状迁移/自动重标定）/C#·shader 静态检查
 ```
 
 ## 目录
@@ -141,8 +142,9 @@ out/demo/              makeup-demo.mp4 演示视频
 
 ## 已验证
 
-- `pytest tests/` **84 项**全过（新增画像管线离线单测：PLY 往返、语义归属、编译器 region
-  隔离/--only、软件光栅裸妆/妆后差异；C#·shader 静态检查现随默认收集运行）
+- `pytest tests/` **182 项**全过（新增 Q 升级离线单测：器官屏蔽/眼动特征/
+  powder SH 衰减/壳层边缘补偿/refshape 仿射与投影/重标定方向逻辑；
+  C#·shader 静态检查随默认收集运行）
 - **画像妆容台链路（P5）**：`avatar_session` register→preview→confirm→station 消息流、
   MKMKP1 tint / MKSEM1 语义二进制两侧一致、真脸附妆默认关闭（`legacyFaceMakeup=false`，
   apply_spec 在画像模式回明确指引）
@@ -160,6 +162,26 @@ out/demo/              makeup-demo.mp4 演示视频
 - 画像表情驱动（P6）：FLAME 系数 rig → 画像 Gaussian 蒙皮（静态画像渲染已就绪，rig 接口已留）
 - ~~FLAME 3DMM 精确拟合~~（并入画像架构：LAM/扫描产物即 FLAME-rig 画像）
 - iOS/Android 移植（ARKit/ARCore 前置摄像头 + 原生人脸追踪替代 sidecar）
+
+## 3DGS 妆容管线底模质量 + 还原度闭环升级（Q，2026-09-21）
+
+对照交付图四大缺陷（牙齿烤进底模 / 眼区彩色碎斑 / 训练视图饥饿 / 还原度
+只有代码没有数字）的成套修复，详见 [docs/photoreal-pipeline.md](docs/photoreal-pipeline.md)
+Q 升级一节：
+
+- **底模质量四件套**：嘴内/眼球损失屏蔽（牙齿不再进底模）、gaze 表情特征
+  （6 维聚类）、训练视图扩容（holdout 6→4 + tau 放宽到 target_frames=24）、
+  SH 高阶 L2 正则（压彩色碎斑）；
+- **还原度闭环**：report.json 第一次带全套数字——逐区域 ΔE00（富化版）+
+  妆感三件套（唇妆强度/identity 锁/唇线锐度）+ 可选 VLM 主观分；超阈值
+  （均值>10 或单区>12）自动按缺妆/过妆方向调整 spec opacity 重烘 ≤2 轮；
+- **形状级还原零依赖替代**（`refshape`）：参考妆照地标仿射 → 区域蒙版搬到
+  用户帧 → 逐 splat 形状权重，眼影晕染范围/眼线翼形跟参考妆走，
+  Stable-Makeup 不再是形状还原的唯一路径；
+- **妆感细节**：底妆压油光（powder 权重衰减底模 SH 残差）、壳层边缘补偿
+  （低权重 splat 面内微扩张，妆缘不斑驳）；
+- **2D/3D 交叉检查**：`--look2d` 把同一 spec 在 2D 人台渲染上的 ΔE00 进
+  report；`--preview-2d` 出 EleGANt 2D 迁移预览（门控增强）。
 
 ## 3DGS 妆容管线写实化重构（R0-R3，2026-09）
 

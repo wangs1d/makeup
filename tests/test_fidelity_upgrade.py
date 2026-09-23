@@ -391,17 +391,34 @@ def _build_layer(cloud, landmarks, tex=256, **kw):
 
 
 def test_makeup_layer_splats_overlap_base_positions(canonical_cloud):
-    """壳层 = 底模对应 splat 表面上的薄层：同 rot/scale，沿外法线偏移
-    ≤ normal_offset×min(scale)（几何上存在、在足迹内不外凸、方向朝外）。"""
+    """壳层 = 底模对应 splat 表面上的薄层：同 rot，沿外法线偏移
+    ≤ normal_offset×min(scale)（几何上存在、在足迹内不外凸、方向朝外）。
+    scale 薄轴与底模一致；面内轴按边缘补偿放大（w<edge_ref 的低权重
+    splat，≤1+SHELL_EDGE_BOOST）——妆缘摊匀不斑驳，层厚不因边缘而变。"""
+    from makeupstudio.face3dgs.appearance.makeup_uv import (
+        SHELL_EDGE_BOOST, SHELL_EDGE_REF)
     cloud, landmarks = canonical_cloud
     _baker, _maps, _binding, layer, idx = _build_layer(cloud, landmarks)
     assert len(idx) > 100                                      # 唇区有足量壳层
     assert np.abs(layer["rot"] - cloud["rot"][idx]).max() == 0.0
-    assert np.abs(layer["scale"] - cloud["scale"][idx]).max() < 1e-9
+    base_scale = np.asarray(cloud["scale"], np.float32)[idx]
+    thin = base_scale.argmin(axis=1)
+    rows = np.arange(len(idx))
+    assert np.allclose(layer["scale"][rows, thin], base_scale[rows, thin],
+                       rtol=1e-5)                              # 薄轴不动
+    other = np.ones_like(layer["scale"], dtype=bool)
+    other[rows, thin] = False
+    ratio = layer["scale"][other] / base_scale[other]
+    assert ratio.min() >= 1.0 - 1e-5                           # 只放不缩
+    assert ratio.max() <= 1.0 + SHELL_EDGE_BOOST + 1e-4        # 补偿上界
+    # 放大只发生在低权重（边缘）splat：w≥edge_ref 的核心完全一致
+    core = layer["makeup_w"] >= SHELL_EDGE_REF
+    if core.any():
+        assert np.allclose(layer["scale"][core], base_scale[core], rtol=1e-5)
     off = layer["xyz"] - cloud["xyz"][idx]
     d = np.linalg.norm(off, axis=1)
-    thin = np.asarray(cloud["scale"], np.float64)[idx].min(axis=1)
-    assert (d <= 0.15 * thin * 1.01 + 1e-9).all()              # 薄层厚度上界
+    thin_w = np.asarray(cloud["scale"], np.float64)[idx].min(axis=1)
+    assert (d <= 0.15 * thin_w * 1.01 + 1e-9).all()            # 薄层厚度上界
     assert d.mean() > 0                                        # 确有物理厚度
     radial = cloud["xyz"][idx] - np.median(np.asarray(cloud["xyz"]), axis=0)
     assert ((off * radial).sum(1) >= -1e-9).mean() > 0.95      # 偏移朝外

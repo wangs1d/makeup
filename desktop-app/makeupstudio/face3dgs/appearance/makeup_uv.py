@@ -30,6 +30,9 @@ FINISH_TARGET = {   # finish → (rough, coat, sheen)
 }
 SKIN_ROUGH = 0.52
 MAP_KEYS = ("rough", "coat", "sss", "sheen")
+POWDER_SH_GAIN = 0.60     # 底妆压油光：powder=1 时 SH 残差剩 40%（粉压哑高光）
+SHELL_EDGE_BOOST = 0.40   # 壳层边缘 splat 非薄轴扩张上限（w→0 处 +40%）
+SHELL_EDGE_REF = 0.60     # 边缘补偿的参考权重（w≥此值不扩张）
 
 
 # ---------------- 颜色空间（float 精度 Lab，D65） ----------------
@@ -129,6 +132,8 @@ class UvMakeupMaps:
     lip_stops: list | None = None       # 唇色带（3D 路径 ramp 用）
     lip_opacity: float = 0.85
     lip_finish: str = "gloss"
+    powder_w: np.ndarray | None = None  # (t,t) 粉类（foundation/concealer）覆盖——
+                                        # 底模 SH 残差衰减（压油光）的依据
 
     @staticmethod
     def empty(tex: int = 2048) -> "UvMakeupMaps":
@@ -138,7 +143,8 @@ class UvMakeupMaps:
             w=np.zeros((tex, tex), np.float32),
             kL=np.zeros((tex, tex), np.float32),
             chroma=np.zeros((tex, tex), np.float32),
-            channels={k: np.zeros((tex, tex), np.float32) for k in MAP_KEYS})
+            channels={k: np.zeros((tex, tex), np.float32) for k in MAP_KEYS},
+            powder_w=np.zeros((tex, tex), np.float32))
 
 
 def _value_noise(tex: int, cell: int, rng: np.random.Generator,
@@ -341,6 +347,8 @@ class UvMakeupBaker:
                     kL_t, chroma_t = PHOTOREAL_LAB.get(region, (0.25, 1.0))
                     maps.kL[upd] = kL_t
                     maps.chroma[upd] = chroma_t
+                    if region in ("foundation", "concealer") and maps.powder_w is not None:
+                        maps.powder_w = np.maximum(maps.powder_w, w[..., 0])
                     # 微观粗糙度：粉状加橘皮（唇釉材质由 3D 路径在 apply 时覆盖）
                     ch = maps.channels
                     ch["rough"][upd] = (rough_t + (micro[upd] - 0.5)
@@ -501,6 +509,7 @@ class UvMakeupBaker:
                        intensity: float = 0.8,
                        near: np.ndarray | None = None,
                        bands3d: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+                       shape3d: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
                        ) -> dict[str, np.ndarray]:
         """UV 目标场 → per-splat 颜色（Lab 部分迁移，保纹理）+ 材质通道。
 
@@ -510,14 +519,15 @@ class UvMakeupBaker:
         near：(n,) splat 到 canonical 表面的距离（bind_uv 产物）——边界软门控，
         UV 归属在鼻翼/眼角/轮廓处的误差按距离衰减妆权重，收掉边界晕。
         bands3d：{"eyeliner"/"lashes"/"eyebrow": (w, cent)} —— `landmark_band_3d`
-        的观测锚定带，覆盖同区域 UV 模板权重（颜色仍取 UV 场，带只改"涂在哪"）。"""
+        的观测锚定带，覆盖同区域 UV 模板权重（颜色仍取 UV 场，带只改"涂在哪"）。
+        shape3d：参考妆照形状权重（refshape 模块），见 build_makeup_layer。"""
         # —— _bilinear 内部按全局 TEX 钳制坐标，采样 2048 图前必须切全局尺寸 ——
         core = _load_core()
         prev_tex = core.TEX
         core.set_texture_size(maps.tex)
         try:
             out = self._apply_locked(cloud, maps, uv, valid, treatment, core,
-                                     lip3d, near, bands3d)
+                                     lip3d, near, bands3d, shape3d)
         finally:
             core.set_texture_size(prev_tex)
         return out
@@ -570,7 +580,8 @@ class UvMakeupBaker:
         hp = np.clip(hp / scale, -1.0, 1.0)
         return hp[tyi, ti]
 
-    def _assignment(self, cloud, maps, uv, valid, core, lip3d, near, bands3d) -> dict:
+    def _assignment(self, cloud, maps, uv, valid, core, lip3d, near, bands3d,
+                    shape3d=None) -> dict:
         """逐 splat 妆容指派：权重（全部门控后）+ 目标色 + 材质通道。
 
         原位重染色（_apply_locked）与独立壳层（build_makeup_layer）共用同一
@@ -619,6 +630,14 @@ class UvMakeupBaker:
                 bw[~valid] = 0.0
                 w = np.maximum(w, bw)
 
+        # ---- 参考妆照形状：参考有妆处取并集，参考明确无妆处压模板 ----
+        # 压制系数 0.35 保留（形变误差/参考图检测失败的兜底不至于全裸）
+        if shape3d:
+            for _region, (bw, _bc) in shape3d.items():
+                bw = np.asarray(bw, np.float32) * gate
+                bw[~valid] = 0.0
+                w = np.where(bw > 0.05, np.maximum(w, bw), w * 0.35)
+
         # ---- 唇妆：3D 锚定优先，UV 兜底 ----
         if maps.lip_w is not None:
             lip_uv = smp(maps.lip_w).astype(np.float32)
@@ -658,6 +677,9 @@ class UvMakeupBaker:
         coat_raw = smp(maps.channels["coat"]).astype(np.float32)
         sss_raw = smp(maps.channels["sss"]).astype(np.float32)
         sheen_raw = smp(maps.channels["sheen"]).astype(np.float32)
+        powder = (smp(maps.powder_w).astype(np.float32)
+                  if maps.powder_w is not None else np.zeros(len(w), np.float32))
+        powder = np.where(lip_zone, 0.0, powder) if lip_zone is not None else powder
         no_lip = ~(lip_zone if lip_zone is not None else np.zeros(len(w), bool))
         # 壳层的全强度材质目标：0 值（UV 通道未写入的边界 texel）回退皮肤
         # 基准，避免边界 splat 变成 rough=0 的超镜面
@@ -677,7 +699,7 @@ class UvMakeupBaker:
             sss_f, sheen_f = sss_raw, sheen_raw
         return {"tx": tx, "ty": ty, "w": w, "gate": gate, "tgt": tgt,
                 "kL": kL, "chroma": chroma, "cur": cur, "hp": hp,
-                "lip_zone": lip_zone,
+                "lip_zone": lip_zone, "powder": powder,
                 "rough_raw": rough_raw, "coat_raw": coat_raw,
                 "sss_raw": sss_raw, "sheen_raw": sheen_raw,
                 "rough": rough_f.astype(np.float32), "coat": coat_f.astype(np.float32),
@@ -715,8 +737,9 @@ class UvMakeupBaker:
             [new_L, new_ab[:, 0], new_ab[:, 1]], axis=1)).astype(np.float32)
 
     def _apply_locked(self, cloud, maps, uv, valid, treatment, core, lip3d,
-                      near, bands3d) -> dict:
-        a = self._assignment(cloud, maps, uv, valid, core, lip3d, near, bands3d)
+                      near, bands3d, shape3d=None) -> dict:
+        a = self._assignment(cloud, maps, uv, valid, core, lip3d, near,
+                             bands3d, shape3d)
         w, tgt, cur = a["w"], a["tgt"], a["cur"]
         out = {}
         for k, v in cloud.items():
@@ -727,6 +750,11 @@ class UvMakeupBaker:
         else:                                   # alpha-over（合成脸校准）
             back = cur * (1 - w[..., None]) + tgt * w[..., None]
         out["rgba"][:, :3] = back
+        # 底妆压油光：粉类权重高的区域，底模 SH 高阶残差（烘焙的视角相关
+        # 油光/高光）按 (1-gain·powder) 衰减——粉把反光压哑，DC 主色不动
+        if "sh_rest" in out and float(a["powder"].max()) > 1e-3:
+            att = (1.0 - POWDER_SH_GAIN * np.clip(a["powder"], 0, 1))[:, None, None]
+            out["sh_rest"] = out["sh_rest"] * att
 
         from .pbr import Material
         lip_zone, hp = a["lip_zone"], a["hp"]
@@ -761,6 +789,7 @@ class UvMakeupBaker:
                            lip3d: tuple[np.ndarray, np.ndarray] | None = None,
                            near: np.ndarray | None = None,
                            bands3d: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+                           shape3d: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
                            min_w: float = 0.05, scale_ratio: float = 1.0,
                            opacity_gain: float = 1.0,
                            normal_offset: float = 0.15,
@@ -775,7 +804,11 @@ class UvMakeupBaker:
                       消除同深度 z-tie（完全共心的两片高斯深度排序不稳定，
                       强妆色差会在视频里闪）；法线 = min(scale) 薄轴 + 径向
                       定向 + kNN 平滑，偏移量在 splat 自身足迹内不外凸；
-            rot/scale 与底模一致（同足迹，不改表面形状）；
+            rot       与底模一致；
+            scale     同足迹；**边缘补偿**：w 低的边缘 splat 沿两个面内轴
+                      扩张（1 + edge_boost×(1−w/edge_ref)）——低 w 壳层
+                      opacity 低，稀疏采样区会斑驳露底，微扩张把妆缘摊匀
+                      （薄轴不动：层厚不因边缘而变）；
             颜色      完整 Lab 迁移目标（kL/chroma 不乘 w——"部分迁移"由
                       alpha 合成完成，物理层即薄层化妆品）× 底模高通纹理
                       （hp_gain：训练出来的唇纹/毛孔透过妆层可见——UV 目标
@@ -785,12 +818,18 @@ class UvMakeupBaker:
             sh_rest   置零（妆色视角无关，不被底模素颜 SH 残差调制；视角
                       相关高光由渲染端 material AOV 合成补回）；
             material  finish 全强度（唇釉清漆/sss/珠光直接挂在壳层上）。
-        返回 (layer_cloud, src_idx)；`merge_makeup_layer` 合并进底模导出。"""
+        shape3d：参考妆照形状权重（refshape.reference_shape_bands）——与
+        bands3d 的并集增强不同，参考形状在"参考图明确没画"的区域把模板
+        权重压制（模板不替参考妆做主），形变失败时权重≈0 自动回退模板。
+        返回 (layer_cloud, src_idx)；layer["_sh_att"] 是底模 SH 衰减系数
+        （底妆压油光），由 merge_makeup_layer 消费后剥离。
+        `merge_makeup_layer` 合并进底模导出。"""
         core = _load_core()
         prev_tex = core.TEX
         core.set_texture_size(maps.tex)
         try:
-            a = self._assignment(cloud, maps, uv, valid, core, lip3d, near, bands3d)
+            a = self._assignment(cloud, maps, uv, valid, core, lip3d, near,
+                                 bands3d, shape3d)
         finally:
             core.set_texture_size(prev_tex)
 
@@ -807,14 +846,30 @@ class UvMakeupBaker:
             col = np.clip(col * (1.0 + a["hp"][:, None] * float(hp_gain)), 0, 1)
         base_op = np.clip(np.asarray(cloud["rgba"], np.float64)[:, 3], 0.0, 0.98)
         op = np.clip(w[idx] * base_op[idx] * float(opacity_gain), 1e-4, 0.98)
+        # 边缘补偿：低 w 的边缘 splat 面内微扩张（薄轴不动），妆缘不再斑驳
+        scale_all = np.asarray(cloud["scale"], np.float32)
+        layer_scale = (scale_all[idx] * float(scale_ratio)).astype(np.float32)
+        if SHELL_EDGE_BOOST > 0 and len(idx):
+            boost = 1.0 + SHELL_EDGE_BOOST * (1.0 - np.clip(
+                w[idx] / SHELL_EDGE_REF, 0.0, 1.0))
+            thin_axis = scale_all[idx].argmin(axis=1)
+            rows = np.arange(len(idx))
+            factor = np.ones((len(idx), 3), np.float64)
+            factor[rows, thin_axis] = 1.0
+            factor[rows, (thin_axis + 1) % 3] = boost
+            factor[rows, (thin_axis + 2) % 3] = boost
+            layer_scale = (layer_scale * factor).astype(np.float32)
         layer = {
             "xyz": np.asarray(cloud["xyz"], np.float32)[idx].copy(),
-            "scale": (np.asarray(cloud["scale"], np.float32)[idx]
-                      * float(scale_ratio)).astype(np.float32),
+            "scale": layer_scale,
             "rot": np.asarray(cloud["rot"], np.float32)[idx].copy(),
             "rgba": np.concatenate(
                 [np.clip(col[idx], 0, 1).astype(np.float32), op[:, None]], 1),
             "makeup_w": w[idx].copy(),
+            "_sh_att": np.clip(
+                1.0 - POWDER_SH_GAIN * np.clip(
+                    np.asarray(a["powder"], np.float32)[idx], 0, 1),
+                0.0, 1.0),
         }
         if float(normal_offset) > 0:
             # 薄层厚度：沿外法线偏移。法线符号用径向定向（薄轴符号逐 splat
@@ -849,11 +904,14 @@ def merge_makeup_layer(base: dict[str, np.ndarray], layer: dict[str, np.ndarray]
     壳层 splat 按构造与底模对应 splat 同位重叠；逐 splat 属性（uv/near 等
     绑定字段）用 src_idx 对应行延伸，保证换妆重绑自洽；壳层独有的标量场
     （makeup_w/gloss/shin）底模侧补零；材质对象逐通道拼接（底模无材质时
-    补皮肤基准）。"""
+    补皮肤基准）。壳层携带的 `_sh_att`（底妆压油光的底模 SH 衰减系数，
+    build_makeup_layer 产出）在此消费：衰减底模侧对应 splat 的 sh_rest，
+    然后从输出剥离（不进导出）。"""
     from .pbr import Material
 
     n_b = len(base["xyz"])
     n_l = len(layer["xyz"])
+    sh_att = layer.pop("_sh_att", None)
     out: dict[str, np.ndarray] = {}
     for k, v in base.items():
         lv = layer.get(k)
@@ -872,6 +930,10 @@ def merge_makeup_layer(base: dict[str, np.ndarray], layer: dict[str, np.ndarray]
             continue
         fill = np.zeros((n_b,) + lv.shape[1:], lv.dtype)
         out[k] = np.concatenate([fill, lv], axis=0)
+    if sh_att is not None and "sh_rest" in out and len(src_idx):
+        # 粉类区域底模 SH 残差衰减（压油光）；fancy-index 赋值写回视图
+        att = np.asarray(sh_att, np.float32)[:, None, None]
+        out["sh_rest"][:n_b][src_idx] = out["sh_rest"][:n_b][src_idx] * att
     mb, ml = base.get("material"), layer.get("material")
     if ml is not None:
         if mb is None:

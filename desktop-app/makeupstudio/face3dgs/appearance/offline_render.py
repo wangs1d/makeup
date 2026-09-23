@@ -402,7 +402,10 @@ def render_pose(prepared: dict, w2c: np.ndarray, K: np.ndarray, size: int = 1024
     img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
     alpha = cv2.resize(alpha, (size, size), interpolation=cv2.INTER_AREA)
     if denoise:
-        img = cv2.edgePreservingFilter(img, flags=1, sigma_s=60, sigma_r=0.45)
+        # 边缘保持滤波压低低清源资产的泼溅颗粒。强度是"降噪 vs 抹细节"的
+        # 折中：sigma_s60/sigma_r0.45 会把眼睑/唇纹压成糊（高还原度诉求下
+        # 不可接受），收敛到 40/0.28——仍去大块色斑，保留高频结构
+        img = cv2.edgePreservingFilter(img, flags=1, sigma_s=40, sigma_r=0.28)
     return (img, alpha) if return_alpha else img
 
 
@@ -568,15 +571,50 @@ def render_compare(base: dict, made: dict, cams: list, out_dir: Path,
     return outs
 
 
+def _render_quality_score(prepared: dict, w2c: np.ndarray, K: np.ndarray,
+                          size: int = 256, k_size: int | None = None) -> float:
+    """渲染退化评分（越低越好）：SH 残差噪声的两大表征——
+    ① 白色冲蚀/空洞：主体内部亮度 > 0.90 的像素占比（SH 把颜色推爆后
+    alpha 合成出洞 + shard 间白缝）；
+    ② 高频混沌：主体区 Laplacian 能量（碎裂渲染远高于平滑人脸）。
+    sh_mode=auto 时 SH 必须显著优于 DC（< 0.85×）才启用 SH——交付稳定性
+    优先。k_size：K 构建时的画幅（orbit K 的 pp=size/2），探测渲染按比例
+    缩放 K，否则主点落在小图外 → 全白帧 → 评分失真。"""
+    if k_size is not None and k_size != size:
+        K = K.copy()
+        K[:2] *= size / k_size
+    img, alpha = render_pose(prepared, w2c, K, size=size, ssaa=1,
+                             denoise=False, return_alpha=True)
+    ys, xs = np.nonzero(alpha > 0.3)
+    if len(xs) < 200:
+        return 1.0
+    x0, x1 = np.percentile(xs, [5, 95]).astype(int)
+    y0, y1 = np.percentile(ys, [5, 95]).astype(int)
+    rgb = img[max(y0, 0):y1 + 1, max(x0, 0):x1 + 1].astype(np.float32) / 255.0
+    a = alpha[max(y0, 0):y1 + 1, max(x0, 0):x1 + 1]
+    interior = cv2.erode((a > 0.5).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    if interior.sum() < 100:
+        return 1.0
+    lum = rgb @ np.array([0.299, 0.587, 0.114], np.float32)
+    white = float((lum[interior] > 0.90).mean())
+    lap = np.abs(cv2.Laplacian(lum, cv2.CV_32F, ksize=3))
+    hf = float(np.clip(lap[interior].mean() / 0.05, 0, 1))
+    return 0.6 * white + 0.4 * hf
+
+
 def deliver(ply: str | Path, out_dir: str | Path, base_ply: str | Path | None = None,
             landmarks_path: str | Path | None = None, sfm_dir: str | Path | None = None,
             n_frames: int = 36, size: int = 1024, ssaa: int = 3, fps: int = 30,
             frame_fill: float = 0.45, denoise: bool = True,
+            sh_mode: str = "auto",
             progress: Callable[[float, str], None] | None = None) -> dict:
     """一键交付：已有资产 → 妆后定妆照 + 环绕视频（+ 素颜对比）。
 
-    sfm_dir（COLMAP sparse）给定时走真实位姿环绕 + SH 全开（推荐）；否则
-    landmark/PCA 推轴窄幅环绕 + DC-only 渲染（SH 视角外推会碎，见 docstring）。
+    sfm_dir（COLMAP sparse）给定时走真实位姿环绕；否则 landmark/PCA 推轴
+    窄幅环绕。sh_mode：auto（默认，推荐）= 探测帧 SH/DC 双向渲染按退化
+    评分自动选择——低清源资产的 SH 二阶残差实测是噪声（训练视线内都有
+    彩斑，稍偏视线即彩虹碎裂+白洞），DC-only 稳定但视角平；其丢失的视角
+    相关高光由妆感材质 AOV 合成（build_shade）补回。"sh"/"dc" 强制指定。
     要求 CUDA + gsplat（训练同款光栅化器）。"""
     try:
         import torch
@@ -638,7 +676,26 @@ def deliver(ply: str | Path, out_dir: str | Path, base_ply: str | Path | None = 
         cams = orbit_synthetic(center, up, front,
                                face_height(made["xyz"], up, center),
                                n=n_frames, size=size)
-    prepared = load_prepared(made, use_sh=use_sh)
+    prepared_sh = load_prepared(made, use_sh=True) if sh_mode != "dc" else None
+    if sh_mode == "auto":
+        # 探测帧双向评分（扫掠中点+两处内点，取各侧最大退化）：SH 残差是
+        # 噪声的资产自动落 DC-only（视角相关高光由 shade AOV 补）。SH 必须
+        # 显著优于 DC（< 0.85×）才启用——交付稳定性优先
+        s_sh = s_dc = 0.0
+        for i in (len(cams) // 4, len(cams) // 2, 3 * len(cams) // 4):
+            w2c_i, K_i = cams[i][0], cams[i][1]
+            s_sh = max(s_sh, _render_quality_score(prepared_sh, w2c_i, K_i,
+                                                   k_size=size))
+            s_dc = max(s_dc, _render_quality_score(
+                load_prepared(made, use_sh=False), w2c_i, K_i, k_size=size))
+        use_sh = s_sh < 0.85 * s_dc
+        cb(0.04, f"sh_mode auto：SH={s_sh:.3f} vs DC={s_dc:.3f} → "
+                 f"{'SH' if use_sh else 'DC-only'}")
+    elif sh_mode == "dc":
+        use_sh = False
+    else:                                        # "sh" 显式指定
+        use_sh = True
+    prepared = prepared_sh if use_sh else load_prepared(made, use_sh=False)
     # 妆感材质进交付：material.bin/light.bin 在 ply 旁时构建着色上下文
     shade = build_shade(made, mat_dir=ply.parent)
 
@@ -649,6 +706,7 @@ def deliver(ply: str | Path, out_dir: str | Path, base_ply: str | Path | None = 
     mp4 = render_turntable(prepared, cams, out_dir, size=size, ssaa=ssaa, fps=fps,
                            denoise=denoise, shade=shade, progress=cb)
     outs = {"stills": [str(p) for p in stills], "turntable": str(mp4), "sh": use_sh,
+            "sh_mode": sh_mode if sh_mode != "auto" else ("sh" if use_sh else "dc-auto"),
             "shade": shade is not None}
     if base_ply is not None and Path(base_ply).exists():
         cb(0.9, "素颜对比…")

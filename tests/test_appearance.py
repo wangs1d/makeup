@@ -47,12 +47,28 @@ def _synthetic_px(mouth_open_px: float = 6.0, mouth_wide_px: float = 96.0,
 
 def test_expression_features_normalized():
     f = expression_features(_synthetic_px())
-    assert f.shape == (4,)
+    assert f.shape == (6,)
     io = 96.0
     assert f[0] == pytest.approx(6.0 / io, abs=1e-6)          # mouth_open
     assert f[1] == pytest.approx(96.0 / io, abs=1e-6)         # mouth_wide
     assert f[2] == pytest.approx(30.0 / io, abs=1e-6)         # brow_gap
     assert f[3] == pytest.approx(12.0 / io, abs=1e-6)         # eye_open
+    assert f[4] == 0.0 and f[5] == 0.0                        # 虹膜缺失 → gaze=0
+
+
+def test_expression_features_gaze_follows_iris():
+    """虹膜有效时 gaze 反映视线偏移；虹膜置零（缺失）时回 0。"""
+    px = _synthetic_px()
+    px[133], px[362] = (124.0, 200.0), (172.0, 200.0)   # 内眼角
+    px[468] = (148.0, 200.0)          # 左虹膜中心（居中）→ gaze≈0
+    px[473] = (148.0, 200.0)
+    f0 = expression_features(px)
+    assert f0[4] == pytest.approx(0.0, abs=1e-6)
+    px_shift = px.copy()
+    px_shift[468] = (158.0, 200.0)    # 虹膜向右移 10px
+    px_shift[473] = (158.0, 200.0)
+    f1 = expression_features(px_shift)
+    assert f1[4] > f0[4] + 0.05       # gaze_x 明显增大
 
 
 def test_select_frames_picks_dominant_cluster(tmp_path):
@@ -95,6 +111,47 @@ def canonical_cloud():
         "rgba": np.concatenate([np.full((len(P), 3), 0.6), np.ones((len(P), 1))], 1),
     }
     return cloud, f.model.base[:468]
+
+
+def test_select_frames_closed_lips_preference(tmp_path):
+    """闭嘴 canonical：微张（0.04）与半开（0.10）两簇并存时优先选闭嘴簇，
+    不让半开帧进训练集（唇区单模态 = 唇纹清晰、无牙齿烤入）。"""
+    import cv2
+    names = [f"frame_{i:05d}.jpg" for i in range(40)]
+    for n in names:
+        cv2.imwrite(str(tmp_path / n), np.zeros((8, 8, 3), np.uint8))
+    closed = names[:20]                            # 闭嘴簇（mouth_open=4px）
+    queue = sorted(names)
+
+    def detect(img, t_ms):
+        name = queue.pop(0)
+        open_px = 4.0 if name in closed else 10.0
+        return {"px": _synthetic_px(mouth_open_px=open_px),
+                "pose": [0.0, 0.0, 0.0]}
+
+    sel = select_frames(tmp_path, names, detect, min_frames=12, max_frames=48)
+    assert len(sel) == 20
+    assert all(n in closed for n in sel.names)     # 半开簇整簇被拒
+
+
+def test_select_frames_closed_lips_fallback(tmp_path):
+    """闭嘴簇帧数不足 min_frames 时回退中位数带（旧行为），不硬饿死。"""
+    import cv2
+    names = [f"frame_{i:05d}.jpg" for i in range(40)]
+    for n in names:
+        cv2.imwrite(str(tmp_path / n), np.zeros((8, 8, 3), np.uint8))
+    closed = names[:6]                             # 只有 6 帧闭嘴（< min_frames）
+    queue = sorted(names)
+
+    def detect(img, t_ms):
+        name = queue.pop(0)
+        open_px = 4.0 if name in closed else 10.0
+        return {"px": _synthetic_px(mouth_open_px=open_px),
+                "pose": [0.0, 0.0, 0.0]}
+
+    sel = select_frames(tmp_path, names, detect, min_frames=24, max_frames=48)
+    assert len(sel) >= 24                          # 回退中位数带，帧数保住
+    assert sel.ref in sel.names
 
 
 def test_bind_uv_and_bake(canonical_cloud):
