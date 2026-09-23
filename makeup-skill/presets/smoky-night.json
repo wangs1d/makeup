@@ -1,0 +1,186 @@
+{
+  "spec_version": "1.0",
+  "name": "smoky-night",
+  "description": "烟熏夜妆：浓黑烟熏眼+夸张上扬眼线+裸棕唇+强轮廓修容，气场全开",
+  "intensity": 0.95,
+  "layers": [
+    {
+      "id": "foundation-both",
+      "region": "foundation",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.75,
+      "finish": "satin",
+      "color_stops": [
+        {"at": 0.0, "hex": "#EFD3BE"},
+        {"at": 1.0, "hex": "#EACBB4"}
+      ],
+      "shape": {"coverage": "full"},
+      "texture_strength": 0.12,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "contour-both",
+      "region": "contour",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.55,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#B08A70"},
+        {"at": 1.0, "hex": "#96705A"}
+      ],
+      "shape": {"areas": ["jaw", "temples", "nose"]},
+      "texture_strength": 0.2,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyebrow-both",
+      "region": "eyebrow",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.75,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#4A3630"},
+        {"at": 1.0, "hex": "#382A26"}
+      ],
+      "shape": {"thickness": 0.42, "arch": 0.75, "tint": 0.9},
+      "texture_strength": 0.4,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyeshadow-left",
+      "region": "eyeshadow",
+      "side": "left",
+      "enabled": true,
+      "opacity": 0.95,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#6B5A58"},
+        {"at": 0.5, "hex": "#43333A"},
+        {"at": 1.0, "hex": "#241C24"}
+      ],
+      "shape": {"spread": 0.95, "height": 0.62, "angle_deg": 22, "lower_lid": 0.9},
+      "texture_strength": 0.15,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyeshadow-right",
+      "region": "eyeshadow",
+      "side": "right",
+      "enabled": true,
+      "opacity": 0.95,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#6B5A58"},
+        {"at": 0.5, "hex": "#43333A"},
+        {"at": 1.0, "hex": "#241C24"}
+      ],
+      "shape": {"spread": 0.95, "height": 0.62, "angle_deg": 22, "lower_lid": 0.9},
+      "texture_strength": 0.15,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyeliner-left",
+      "region": "eyeliner",
+      "side": "left",
+      "enabled": true,
+      "opacity": 0.95,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#171214"},
+        {"at": 1.0, "hex": "#171214"}
+      ],
+      "shape": {"thickness": 0.45, "wing": 0.65, "lower": 0.6},
+      "texture_strength": 0.0,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "eyeliner-right",
+      "region": "eyeliner",
+      "side": "right",
+      "enabled": true,
+      "opacity": 0.95,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#171214"},
+        {"at": 1.0, "hex": "#171214"}
+      ],
+      "shape": {"thickness": 0.45, "wing": 0.65, "lower": 0.6},
+      "texture_strength": 0.0,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "blush-left",
+      "region": "blush",
+      "side": "left",
+      "enabled": true,
+      "opacity": 0.42,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#C08A80"},
+        {"at": 1.0, "hex": "#A8706A"}
+      ],
+      "shape": {"radius": 0.11, "angle_deg": 28, "falloff": 0.85},
+      "texture_strength": 0.15,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "blush-right",
+      "region": "blush",
+      "side": "right",
+      "enabled": true,
+      "opacity": 0.42,
+      "finish": "matte",
+      "color_stops": [
+        {"at": 0.0, "hex": "#C08A80"},
+        {"at": 1.0, "hex": "#A8706A"}
+      ],
+      "shape": {"radius": 0.11, "angle_deg": -28, "falloff": 0.85},
+      "texture_strength": 0.15,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "highlight-both",
+      "region": "highlight",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.45,
+      "finish": "glitter",
+      "color_stops": [
+        {"at": 0.0, "hex": "#F5E3D2"},
+        {"at": 1.0, "hex": "#FDF4EA"}
+      ],
+      "shape": {"areas": ["cheek", "cupid"]},
+      "texture_strength": 0.1,
+      "render": {"type": "mesh"}
+    },
+    {
+      "id": "lipstick-both",
+      "region": "lipstick",
+      "side": "both",
+      "enabled": true,
+      "opacity": 0.85,
+      "finish": "satin",
+      "color_stops": [
+        {"at": 0.0, "hex": "#B08276"},
+        {"at": 1.0, "hex": "#8F5F55"}
+      ],
+      "shape": {"overline": 0.04, "blur": 0.08, "gradation": 0.1},
+      "texture_strength": 0.08,
+      "render": {"type": "splat", "splat": {"thickness": 0.0015, "density": 0.8}}
+    }
+  ],
+  "steps": [
+    {"order": 1, "area": "base", "regions": ["foundation", "contour"],
+     "instruction": "哑光底妆遮瑕到位，下颌线/颞部/鼻侧影重修容"},
+    {"order": 2, "area": "eye", "regions": ["eyeshadow", "eyeliner"],
+     "instruction": "深色从睫毛根向上晕开至眼窝（边缘一定要晕干净），上下眼线连成一体、眼尾大幅上扬"},
+    {"order": 3, "area": "blush", "regions": ["blush", "highlight"],
+     "instruction": "腮红极淡斜扫即可，颧骨点珠光高光提气场"},
+    {"order": 4, "area": "lip", "regions": ["lipstick"],
+     "instruction": "裸棕色唇线笔描全唇后填色，压住浓眼的存在感"}
+  ],
+  "source": {"type": "preset", "origin": "built-in", "created_at": "2026-09-19"}
+}
