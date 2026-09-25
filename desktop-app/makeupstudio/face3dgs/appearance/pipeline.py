@@ -466,7 +466,7 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
     if zones is not None and zones.fields and zones.fields.seg:
         # 几何级留痕修正 + IoU 诊断：同一次 _assignment 关掉观测即纯几何兜底
         # （level 3/4），语义观测妆区与它的 IoU 直接度量"数据驱动把模板挪了多远"。
-        from .semantics import iou as _zone_iou
+        from .semantics import iou as _zone_iou, ZONE_IOU_MIN
         geom = baker.assignment(cloud, maps, binding.uv, binding.valid,
                                 lip3d=lip3d, near=binding.near,
                                 bands3d=bands3d or None)
@@ -479,8 +479,16 @@ def apply_makeup_to_asset(cloud: dict, landmarks: np.ndarray, spec: dict,
                                 else "uv_template")
             zs = zones.fields.seg.get(rgn)
             if zs is not None:
-                rec["iou_vs_geometry"] = round(_zone_iou(
-                    np.asarray(zs.p) > 0.5, np.asarray(geom["w"]) > 0.05), 4)
+                iou_v = _zone_iou(np.asarray(zs.p) > 0.5,
+                                  np.asarray(geom["w"]) > 0.05)
+                rec["iou_vs_geometry"] = round(iou_v, 4)
+                if iou_v < ZONE_IOU_MIN:
+                    # 观测与几何严重互斥 → 观测不可信（低清源标定/分割误差
+                    # 大于形状收益，启用会撒全脸彩屑）：丢语义场回落几何兜底，
+                    # IoU 留痕保留。烘焙（_bake_to_made）在此之后，来得及拦。
+                    del zones.fields.seg[rgn]
+                    rec["level"] = "uv_template"
+                    rec["dropped"] = f"iou<{ZONE_IOU_MIN}"
         cb("makeup", 0.62, "语义观测妆区 " + (zones.summary() or "（无）")
            + " IoU=" + str({r: v.get("iou_vs_geometry") for r, v in
                             zones.report.items() if v.get("iou_vs_geometry")}))
@@ -1184,8 +1192,13 @@ def _observe_zones(cloud: dict, model: colmap_io.SparseModel,
     from ...parser import FaceParser
 
     layers = [l for l in spec.get("layers", []) if l.get("enabled", True)]
+    # 大区域（粉底）不参与语义观测：multiply 回退会把"未观测"折成 coverage
+    # 惩罚（fallback_ratio=0.45），低清源 8 视角观测覆盖不全时整脸粉底被砍
+    # （实测 448k→24k 壳层 splats）。语义只服务精度关键的小区域（唇/眉/眼），
+    # 观测覆盖随分辨率上来后再放开。
     regions = tuple(dict.fromkeys(l.get("region") for l in layers
-                                  if l.get("region")))
+                                  if l.get("region")
+                                  and l.get("region") != "foundation"))
     if not regions:
         return None
     region_scale: dict[str, float] = {}
